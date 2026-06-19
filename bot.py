@@ -14,8 +14,12 @@ Telegram Group Sticker Management Bot (python-telegram-bot v22.7)
 import json, logging, os, random, re
 from pathlib import Path
 
-from dotenv import load_dotenv
-load_dotenv()
+# 尝试加载 .env，失败则跳过
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from telegram import Update
 from telegram import BotCommand
