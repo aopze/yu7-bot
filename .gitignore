@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 bot.log
+bot.log.*
 data/
 *.json
-!requirements.txt
+!requirements.json
+*.bat
+*.lnk
+*.bak
