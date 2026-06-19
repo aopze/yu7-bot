@@ -1,0 +1,2565 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telegram Group Sticker Management Bot (python-telegram-bot v22.7)
+Features:
+1. Sticker keyword auto-reply (per-keyword random/non-repeat, queue persisted)
+2. Per-group keyword isolation: each group can have its own keyword list
+3. Inline mode: keyword draw adds to hand, inline send removes from hand (card-game)
+4. Per-keyword management via buttons with group selection
+"""
+import json, logging, os, random, re
+from pathlib import Path
+from typing import Dict, List
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedSticker, MessageEntity
+from telegram import BotCommand
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, InlineQueryHandler,
+    ChosenInlineResultHandler, filters, ContextTypes, CallbackQueryHandler,
+    ChatMemberHandler,
+)
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+CONFIG_FILE = Path(__file__).parent / "config.json"
+QUEUE_FILE = Path(__file__).parent / "queue_state.json"
+INLINE_QUEUE_FILE = Path(__file__).parent / "inline_queue_state.json"
+DISCARD_FILE = Path(__file__).parent / "discard_state.json"
+HAND_FILE = Path(__file__).parent / "hand_state.json"
+EMOJI_QUEUE_FILE = Path(__file__).parent / "emoji_queue_state.json"
+EMOJI_DISCARD_FILE = Path(__file__).parent / "emoji_discard_state.json"
+
+# Main (sticker)
+sticker_cache: Dict[str, List[str]] = {}
+sticker_queue: Dict[str, List[str]] = {}
+# Inline (card game)
+inline_cache: Dict[str, List[str]] = {}
+inline_queue: Dict[str, List[str]] = {}
+inline_hand: Dict[str, Dict[int, List[str]]] = {}
+inline_discard: Dict[str, Dict[int, List[str]]] = {}  # {"set_name": {user_id: [file_ids]}}
+# Emoji (custom emoji pack, same as sticker but replies with emoji)
+emoji_cache: Dict[str, Dict[str, str]] = {}   # pack_name → {custom_emoji_id: emoji_char}
+emoji_queue: Dict[str, List[str]] = {}       # pack_name → shuffled
+emoji_discard: Dict[str, Dict[int, List[str]]] = {}  # pack_name → {user_id: [ids]}
+# Image (Telegram photo file_ids, same as sticker but sends photos)
+img_cache: Dict[str, List[str]] = {}           # kw_key → [file_id, ...]
+img_queue: Dict[str, List[str]] = {}           # kw_key → shuffled
+img_discard: Dict[str, Dict[int, List[str]]] = {}  # kw_key → {user_id: [file_ids]}
+img_collect: Dict[int, List[str]] = {}         # {user_id: [file_id, ...]} — adding
+img_collect_kw: Dict[int, str] = {}            # {user_id: keyword} — adding
+# 计数器模式
+counter_enabled: Dict[str, bool] = {}          # {chat_tid_key: True}
+counter_data: Dict[str, Dict[int, Dict[str, int]]] = {}   # {chat_tid_key: {user_id: {kw: val}}}
+counter_msg: Dict[str, Dict[int, int]] = {}    # {chat_tid_key: {user_id: msg_id}}
+# 阵列模式全局状态
+array_board = [['⬜'] * 9 for _ in range(9)]   # 9x9 五子棋盘
+array_players = {}                                 # {user_id: 'X'|'O'}
+array_board_msg: Dict[int, tuple] = {}                     # {chat_id: (msg_id, thread_id)}
+
+waiting_for_input: Dict[int, str] = {}
+user_selected_group: Dict[int, str] = {}  # {user_id: group_id} - which group user manages in private chat
+user_common_groups: Dict[int, Dict[str, str]] = {}  # {user_id: {group_id: group_name}} - cached common groups
+pending_copy: Dict[int, dict] = {}  # {user_id: {kw, is_inline, source_gid}} - pending copy operation
+
+# ========== Persist helpers ==========
+def _save_json(file, data):
+    try:
+        with open(file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Save json failed {file.name if hasattr(file, 'name') else file}: {e}")
+
+def _save_hand():
+    """Save inline hand state to separate file (lightweight, frequent writes)."""
+    try:
+        _save_json(HAND_FILE, inline_hand)
+    except Exception:
+        pass
+
+def _load_json(file):
+    if file.exists():
+        try:
+            with open(file, 'r', encoding='utf-8') as f: return json.load(f)
+        except Exception: pass
+    return {}
+
+# ========== Migration ==========
+def _migrate_config():
+    """Migrate old flat keyword structure to group-based structure."""
+    sk = config.get('sticker_keywords', {})
+    if not sk:
+        return
+    first_val = next(iter(sk.values()))
+    # Old format: values are dicts with 'set' key (keyword entries)
+    if isinstance(first_val, dict) and 'set' in first_val:
+        logger.info("Migrating config to group-based structure...")
+        config['sticker_keywords'] = {'_global': sk}
+        ik = config.get('inline_sticker_keywords', {})
+        if ik:
+            first_ik = next(iter(ik.values()))
+            if isinstance(first_ik, dict) and 'set' in first_ik:
+                config['inline_sticker_keywords'] = {'_global': ik}
+            else:
+                config['inline_sticker_keywords'] = {'_global': ik}
+        else:
+            config['inline_sticker_keywords'] = {'_global': {}}
+        if 'known_groups' not in config:
+            config['known_groups'] = {}
+        if 'emoji_keywords' not in config:
+            config['emoji_keywords'] = {'_global': {}}
+        save_config(config)
+        logger.info("Migration complete!")
+
+    # Migrate random:bool to mode:str for all keywords
+    migrated = False
+    for section in ['sticker_keywords', 'inline_sticker_keywords']:
+        for gid, kws in config.get(section, {}).items():
+            if not isinstance(kws, dict): continue
+            for kw, v in list(kws.items()):
+                if isinstance(v, dict) and 'mode' not in v:
+                    v['mode'] = 'random' if v.pop('random', False) else 'sequential'
+                    migrated = True
+    if migrated:
+        logger.info("Migrated random→mode for keywords")
+        save_config(config)
+
+# ========== Config helpers (group-aware) ==========
+def _get_sk(group_id='_global'):
+    return config.get('sticker_keywords', {}).get(str(group_id) if group_id else '_global', {})
+
+def _get_ik(group_id='_global'):
+    return config.get('inline_sticker_keywords', {}).get(str(group_id) if group_id else '_global', {})
+
+def _get_set(kw, group_id='_global'):
+    sk = _get_sk(group_id)
+    return sk.get(kw, {}).get('set', '') if isinstance(sk.get(kw), dict) else sk.get(kw, '')
+
+def _get_random(kw, group_id='_global'):
+    sk = _get_sk(group_id)
+    v = sk.get(kw, {})
+    if isinstance(v, dict) and 'mode' in v:
+        return v['mode'] == 'random'
+    return v.get('random', False)
+
+def _get_mode(kw, group_id='_global'):
+    """Get keyword mode: 'random', 'sequential', or 'limited'."""
+    sk = _get_sk(group_id)
+    v = sk.get(kw, {})
+    if isinstance(v, dict):
+        mode = v.get('mode', '')
+        if mode: return mode
+        return 'random' if v.get('random', False) else 'sequential'
+    return 'sequential'
+
+def _set_mode(kw, mode, group_id='_global'):
+    gid = str(group_id) if group_id else '_global'
+    config.setdefault('sticker_keywords',{}).setdefault(gid,{}).setdefault(kw,{})['mode'] = mode
+    config['sticker_keywords'][gid][kw].pop('random', None)
+    save_config(config)
+
+def _get_mode_label(mode):
+    return {'random': '重复', 'sequential': '不重复', 'limited': '有限'}.get(mode, mode)
+
+def _next_mode(current):
+    order = ['random', 'sequential', 'limited']
+    idx = order.index(current) if current in order else 0
+    return order[(idx + 1) % 3]
+
+def _inline_get_set(kw, group_id='_global'):
+    ik = _get_ik(group_id)
+    return ik.get(kw, {}).get('set', '') if isinstance(ik.get(kw), dict) else ik.get(kw, '')
+
+def _inline_get_mode(kw, group_id='_global'):
+    """Get inline keyword mode: 'random', 'sequential', or 'limited'."""
+    ik = _get_ik(group_id)
+    v = ik.get(kw, {})
+    if isinstance(v, dict):
+        mode = v.get('mode', '')
+        if mode: return mode
+        return 'random' if v.get('random', False) else 'sequential'
+    return 'sequential'
+
+def _inline_set_mode(kw, mode, group_id='_global'):
+    gid = str(group_id) if group_id else '_global'
+    config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{}).setdefault(kw,{})['mode'] = mode
+    config['inline_sticker_keywords'][gid][kw].pop('random', None)
+    save_config(config)
+
+def _get_ek(group_id='_global'):
+    """Get emoji_keywords for a group."""
+    return config.get('emoji_keywords', {}).get(str(group_id) if group_id else '_global', {})
+
+def _emoji_get_set(kw, group_id='_global'):
+    ek = _get_ek(group_id)
+    return ek.get(kw, {}).get('set', '') if isinstance(ek.get(kw), dict) else ek.get(kw, '')
+
+def _emoji_get_mode(kw, group_id='_global'):
+    ek = _get_ek(group_id)
+    v = ek.get(kw, {})
+    if isinstance(v, dict):
+        mode = v.get('mode', '')
+        if mode: return mode
+        return 'random' if v.get('random', False) else 'sequential'
+    return 'sequential'
+
+def _emoji_set_mode(kw, mode, group_id='_global'):
+    gid = str(group_id) if group_id else '_global'
+    config.setdefault('emoji_keywords',{}).setdefault(gid,{}).setdefault(kw,{})['mode'] = mode
+    config['emoji_keywords'][gid][kw].pop('random', None)
+    save_config(config)
+
+def _inline_get_sort(kw, group_id='_global'):
+    ik = _get_ik(group_id)
+    v = ik.get(kw, {})
+    return v.get('sort', True) if isinstance(v, dict) else True
+
+def _get_img_kw(group_id='_global'):
+    return config.get('image_keywords', {}).get(str(group_id) if group_id else '_global', {})
+
+def _img_kw_key(gid, kw):
+    return f"{gid}:{kw}"
+
+def _img_get_files(kw, group_id='_global'):
+    ik = _get_img_kw(group_id)
+    v = ik.get(kw, {})
+    return v.get('files', []) if isinstance(v, dict) else []
+
+def _img_get_mode(kw, group_id='_global'):
+    ik = _get_img_kw(group_id)
+    v = ik.get(kw, {})
+    return v.get('mode', 'random') if isinstance(v, dict) else 'random'
+
+def _img_set_mode(kw, mode, group_id='_global'):
+    gid = str(group_id) if group_id else '_global'
+    config.setdefault('image_keywords',{}).setdefault(gid,{}).setdefault(kw,{})['mode'] = mode
+    save_config(config)
+
+def _inline_set_sort(kw, val, group_id='_global'):
+    gid = str(group_id) if group_id else '_global'
+    config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[kw]['sort'] = val
+    save_config(config)
+
+def _is_limited_set(sn):
+    """Check if any inline keyword points to this set in limited mode."""
+    for gid, kws in config.get('inline_sticker_keywords', {}).items():
+        for kw, v in kws.items():
+            s = v.get('set', '') if isinstance(v, dict) else v
+            if s == sn:
+                mode = v.get('mode', '') if isinstance(v, dict) else ''
+                if mode == 'limited':
+                    return True
+                if not mode and v.get('random'):
+                    return False  # Old format without mode
+    return False
+
+def _get_group_name(gid):
+    if str(gid) == '_global':
+        return '全局默认'
+    return config.get('known_groups', {}).get(str(gid), f'群组 {gid}')
+
+def _resolve_group(update, user_id):
+    """Resolve group context: in group chat use chat_id, in private use user_selected_group."""
+    chat = update.effective_chat
+    if chat and chat.type in ['group', 'supergroup']:
+        gid = str(chat.id)
+        # Auto-register group in known_groups
+        known = config.setdefault('known_groups', {})
+        if gid not in known:
+            known[gid] = chat.title or f"群组{gid}"
+            save_config(config)
+        # Auto-set as user's selected group for management
+        user_selected_group[user_id] = gid
+        return gid
+    return user_selected_group.get(user_id, '_global')
+
+async def _refresh_common_groups(bot, user_id):
+    """Check which known groups the user is a member of. Cache the result."""
+    known = config.get('known_groups', {})
+    common = {}
+    for group_id, group_name in known.items():
+        try:
+            member = await bot.get_chat_member(int(group_id), user_id)
+            if member.status in ['member', 'administrator', 'creator', 'restricted']:
+                common[group_id] = group_name
+        except Exception:
+            pass
+    user_common_groups[user_id] = common
+    logger.info(f"Common groups for user {user_id}: {len(common)} groups")
+    return common
+
+def _all_sticker_sets():
+    """Get all unique sticker/emoji set names across all groups."""
+    sets = set()
+    for gid, kws in config.get('sticker_keywords', {}).items():
+        for v in kws.values():
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            if sn: sets.add(sn)
+    for gid, kws in config.get('inline_sticker_keywords', {}).items():
+        for v in kws.values():
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            if sn: sets.add(sn)
+    for gid, kws in config.get('emoji_keywords', {}).items():
+        for v in kws.values():
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            if sn: sets.add(sn)
+    return sets
+
+def _init_queue(sn, cache, queue):
+    if sn in cache:
+        stickers = list(cache[sn]); random.shuffle(stickers); queue[sn] = stickers
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {"keywords": {}, "sticker_keywords": {"_global": {}},
+                "inline_sticker_keywords": {"_global": {}},
+                "emoji_keywords": {"_global": {}},
+                "image_keywords": {"_global": {}}, "known_groups": {},
+                "admin_ids": [], "enabled_features": {"keyword_reply": True}}
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+
+def save_config(cfg): _save_json(CONFIG_FILE, cfg)
+
+config = load_config()
+_migrate_config()  # Auto-migrate old format
+
+# ========== Preload ==========
+async def preload_sticker_sets(context=None, app=None):
+    bot = (app.bot if app else context.bot) if (app or context) else None
+    if not bot: return
+
+    all_sets = _all_sticker_sets()
+    sq = _load_json(QUEUE_FILE)
+    for sn in all_sets:
+        try:
+            ss = await bot.get_sticker_set(name=sn)
+            stickers = [s.file_id for s in ss.stickers]
+            sticker_cache[sn] = stickers
+            inline_cache[sn] = list(stickers)
+            if sn in sq:
+                valid = [f for f in sq[sn] if f in set(stickers)]
+                sticker_queue[sn] = valid if valid else None
+            if sn not in sticker_queue or not sticker_queue[sn]:
+                _init_queue(sn, sticker_cache, sticker_queue)
+            logger.info(f"'{sn}': {len(stickers)}, queue={len(sticker_queue.get(sn,[]))}")
+        except Exception as e:
+            logger.error(f"Preload fail '{sn}': {e}")
+
+    # Inline queues and hands
+    iq = _load_json(INLINE_QUEUE_FILE)
+    inline_hand.clear(); inline_hand.update(_load_json(HAND_FILE))
+    for gid, kws in config.get('inline_sticker_keywords', {}).items():
+        for kw, v in kws.items():
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            if not sn: continue
+            if sn not in inline_cache:
+                try:
+                    ss = await bot.get_sticker_set(name=sn)
+                    inline_cache[sn] = [s.file_id for s in ss.stickers]
+                except Exception: continue
+            if sn in iq:
+                valid = [f for f in iq[sn] if f in set(inline_cache.get(sn, []))]
+                inline_queue[sn] = valid if valid else None
+            if sn not in inline_queue or not inline_queue[sn]:
+                _init_queue(sn, inline_cache, inline_queue)
+            if sn in inline_hand:
+                for uid in list(inline_hand[sn]):
+                    inline_hand[sn][uid] = [f for f in inline_hand[sn][uid]
+                                             if f in set(inline_cache.get(sn, []))]
+                    if not inline_hand[sn][uid]: del inline_hand[sn][uid]
+            logger.info(f"Inline '{sn}': {len(inline_cache.get(sn,[]))}, queue={len(inline_queue.get(sn,[]))}, hand_users={len(inline_hand.get(sn,{}))}")
+
+    # Load discard piles for limited mode
+    dc = _load_json(DISCARD_FILE)
+    inline_discard.clear(); inline_discard.update(dc)
+    # Validate discard stickers still exist (per-user)
+    for sn in list(inline_discard.keys()):
+        if sn in inline_cache:
+            users = inline_discard[sn]
+            for uid in list(users.keys()):
+                users[uid] = [f for f in users[uid] if f in set(inline_cache[sn])]
+                if not users[uid]:
+                    del users[uid]
+            if users:
+                total = sum(len(v) for v in users.values())
+                logger.info(f"Discard '{sn}': {total} cards across {len(users)} users")
+            else:
+                del inline_discard[sn]
+        else:
+            del inline_discard[sn]
+
+    config.setdefault('_runtime', {})['inline_hand'] = inline_hand
+    _save_hand()
+
+    # === Emoji preloading ===
+    eq = _load_json(EMOJI_QUEUE_FILE)
+    for gid, kws in config.get('emoji_keywords', {}).items():
+        for v in kws.values():
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            if not sn or sn in emoji_cache: continue
+            try:
+                ss = await bot.get_sticker_set(name=sn)
+                emoji_cache[sn] = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                logger.info(f"Emoji '{sn}': {len(emoji_cache[sn])} emojis")
+            except Exception as e:
+                logger.error(f"Emoji preload fail '{sn}': {e}")
+    for sn in list(emoji_cache.keys()):
+        if sn in eq:
+            valid = [f for f in eq[sn] if f in set(emoji_cache.get(sn, []))]
+            emoji_queue[sn] = valid if valid else None
+        if sn not in emoji_queue or not emoji_queue[sn]:
+            _init_queue(sn, emoji_cache, emoji_queue)
+
+    # Load emoji discard piles for limited mode
+    ed = _load_json(EMOJI_DISCARD_FILE)
+    emoji_discard.clear(); emoji_discard.update(ed)
+    for sn in list(emoji_discard.keys()):
+        if sn in emoji_cache:
+            users = emoji_discard[sn]
+            for uid in list(users.keys()):
+                users[uid] = [f for f in users[uid] if f in set(emoji_cache[sn])]
+                if not users[uid]: del users[uid]
+            if not users: del emoji_discard[sn]
+        else:
+            del emoji_discard[sn]
+
+    try: save_config(config)
+    except Exception: pass
+
+# ========== Menu builders ==========
+def _show_main_menu_text(user, group_id='_global'):
+    """Build the main menu text and keyboard."""
+    gname = _get_group_name(group_id)
+    text = (
+        f"你好 {user.first_name}!\n"
+        f"管理群组: {gname}\n\n"
+        f"/help 查看命令"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("选择群组", callback_data='select_group')],
+        [InlineKeyboardButton("关键词管理", callback_data='manage_keywords')],
+    ])
+    return text, keyboard
+
+def _build_list_keyboard(inline=False, emoji=False, image=False, group_id='_global'):
+    if image:
+        sk = _get_img_kw(group_id); cache = img_cache; get_mode = _img_get_mode
+        prefix = 'replace_image_'; delete_prefix = 'delete_image_'
+    elif emoji:
+        sk = _get_ek(group_id); cache = emoji_cache; get_mode = _emoji_get_mode
+        prefix = 'replace_emoji_'; delete_prefix = 'delete_emoji_'
+    elif inline:
+        sk = _get_ik(group_id); cache = inline_cache; get_mode = _inline_get_mode
+        prefix = 'replace_inline_'; delete_prefix = 'delete_inline_'
+    else:
+        sk = _get_sk(group_id); cache = sticker_cache; get_mode = _get_mode
+        prefix = 'replace_'; delete_prefix = 'delete_'
+    copy_prefix = 'copyinline_' if inline else 'copykw_'
+    keyboard = []
+    for kw in sk:
+        v = sk[kw]
+        if image:
+            files = v.get('files', []) if isinstance(v, dict) else []
+            cnt = len(files); sn_display = f"{cnt}张"
+            dc_count = sum(len(v) for v in img_discard.get(_img_kw_key(group_id, kw), {}).values())
+            dcount = f" 弃牌{dc_count}" if dc_count > 0 else ""
+            mode = get_mode(kw, group_id)
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{kw} ({sn_display})[{_get_mode_label(mode)}]{dcount} [替换]",
+                    callback_data=f'{prefix}{kw}'
+                ),
+                InlineKeyboardButton("删除", callback_data=f'{delete_prefix}{kw}')
+            ])
+            continue
+        sn = v.get('set', '') if isinstance(v, dict) else v
+        cnt = len(cache.get(sn, []))
+        total_hand = sum(len(v) for v in inline_hand.get(sn, {}).values()) if inline else 0
+        hcnt = f" 手牌{total_hand}" if inline and total_hand else ""
+        if image:
+            total_dc = sum(len(v) for v in img_discard.get(sn, {}).values())
+            dcount = f" 弃牌{total_dc}" if total_dc > 0 else ""
+        elif emoji:
+            total_dc = sum(len(v) for v in emoji_discard.get(sn, {}).values())
+            dcount = f" 弃牌{total_dc}" if total_dc > 0 else ""
+        elif inline:
+            total_dc = sum(len(v) for v in inline_discard.get(sn, {}).values())
+            dc_users = len(inline_discard.get(sn, {}))
+            if total_dc > 0:
+                dcount = f" 弃牌{total_dc}" if dc_users == 1 else f" 弃牌{total_dc}({dc_users}人)"
+            else:
+                dcount = ""
+        else:
+            dcount = ""
+        mode = get_mode(kw, group_id)
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{kw} -> {sn} ({cnt}张)[{_get_mode_label(mode)}]{hcnt}{dcount} [替换]",
+                callback_data=f'{prefix}{kw}'
+            ),
+            InlineKeyboardButton(
+                "添加到其他群组",
+                callback_data=f'{copy_prefix}{kw}'
+            ) if not image else InlineKeyboardButton(
+                "删除",
+                callback_data=f'{delete_prefix}{kw}'
+            ),
+            InlineKeyboardButton(
+                "删除",
+                callback_data=f'{delete_prefix}{kw}'
+            ) if not image else None,
+        ])
+        # Remove None entries from image rows
+        keyboard[-1] = [b for b in keyboard[-1] if b is not None]
+    keyboard.append([InlineKeyboardButton("返回", callback_data='back_to_start')])
+    return keyboard
+
+def _build_group_select_keyboard(user_id, groups=None, page=0):
+    """Build a paginated group selection keyboard.
+    If groups is a dict, use it directly. Otherwise read from known_groups.
+    """
+    if groups is None:
+        known = config.get('known_groups', {})
+        groups = {'_global': '全局默认', **known}
+    else:
+        groups = {'_global': '全局默认', **groups}
+
+    groups_list = list(groups.items())
+    selected = user_selected_group.get(user_id, '_global')
+
+    per_page = 6; start = page * per_page; end = start + per_page
+    page_groups = groups_list[start:end]
+
+    keyboard = []
+    for gid, name in page_groups:
+        label = f"✓ {name}" if str(gid) == str(selected) else name
+        keyboard.append([InlineKeyboardButton(label, callback_data=f'setgroup_{gid}')])
+
+    # Pagination
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ 上一页", callback_data=f'group_page_{page-1}'))
+    if end < len(groups_list):
+        nav.append(InlineKeyboardButton("下一页 ▶", callback_data=f'group_page_{page+1}'))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("返回主菜单", callback_data='back_to_start')])
+    return InlineKeyboardMarkup(keyboard)
+
+def _build_copy_target_keyboard(user_id, targets, is_inline=False):
+    """Build keyboard for selecting a target group to copy keyword to."""
+    prefix = 'docopyi_' if is_inline else 'docopy_'
+    keyboard = []
+    for tgid, tname in targets.items():
+        keyboard.append([InlineKeyboardButton(
+            tname,
+            callback_data=f'{prefix}{tgid}'
+        )])
+    keyboard.append([InlineKeyboardButton("取消返回", callback_data='cancel_replace')])
+    return InlineKeyboardMarkup(keyboard)
+
+# ========== /yu ==========
+async def start(update, context):
+    user = update.effective_user; user_id = user.id
+    group_id = _resolve_group(update, user_id)
+
+    # On first /yu in private chat, check common groups once
+    chat = update.effective_chat
+    if chat and chat.type == 'private' and user_id not in user_common_groups:
+        await _refresh_common_groups(context.bot, user_id)
+
+    text, markup = _show_main_menu_text(user, group_id)
+    await update.message.reply_text(text, reply_markup=markup)
+
+async def help_command(update, context):
+    await update.message.reply_text(
+        "关键词使用方式:\n"
+        "关键词 N: 抽取N张卡牌\n"
+        "关键词 0: 洗入弃牌堆卡牌\n"
+        "关键词 Nd: 明牌抽取N张卡牌\n"
+        "关键词 Nw: 展示牌堆顶N张卡牌\n"
+        "关键词 Nf: 弃置牌堆顶N张卡牌\n"
+        "d: 回复贴纸 d 回收至手牌；回复图片 d 回收至牌库\n"
+        "f: 回复图片 f 弃置（跳过后再抽）\n"
+        "数字-数字-数字: 连续打出多张卡牌\n"
+        "数字-数字-数字/: 连续明牌打出多张卡牌\n"
+        "数字~数字: 打出序号连贯的卡牌"
+    )
+
+async def show_sticker_keywords(update, context):
+    user_id = update.effective_user.id
+    group_id = _resolve_group(update, user_id)
+    sk = _get_sk(group_id)
+    if not sk: return await update.message.reply_text('无关键词')
+    await update.message.reply_text("\n".join(f"  {k} -> {_get_set(k, group_id)}" for k in sk))
+
+async def add_sticker_keyword(update, context):
+    user_id = update.effective_user.id
+    if user_id not in config.get('admin_ids',[]): return await update.message.reply_text('仅管理员')
+    if len(context.args) < 2: return await update.message.reply_text('/addsticker <关键词> <包名>')
+    kw, sn = context.args[0], context.args[1]
+    group_id = user_selected_group.get(user_id, '_global')
+    gid = str(group_id)
+    try:
+        ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]
+        sticker_cache[sn] = stickers; _init_queue(sn, sticker_cache, sticker_queue)
+        config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "sequential"}
+        save_config(config)
+        gname = _get_group_name(group_id)
+        await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({len(stickers)}张)")
+    except Exception as e: await update.message.reply_text(f"失败: {e}")
+
+async def cancel(update, context):
+    uid = update.effective_user.id
+    if uid in waiting_for_input:
+        # If collecting images, save them
+        if waiting_for_input[uid] == "collect_image" and uid in img_collect_kw:
+            kw = img_collect_kw.pop(uid)
+            files = img_collect.pop(uid, [])
+            gid = str(user_selected_group.get(uid, '_global'))
+            if files:
+                key = _img_kw_key(gid, kw)
+                config.setdefault('image_keywords', {}).setdefault(gid, {})[kw] = {"files": files, "mode": "random"}
+                save_config(config)
+                img_cache[key] = list(files); _init_queue(key, img_cache, img_queue)
+                gname = _get_group_name(gid)
+                await update.message.reply_text(f"图片添加完成! [{gname}] {kw} ({len(files)}张)")
+            else:
+                img_collect_kw.pop(uid, None)
+                await update.message.reply_text(f"未收到图片，已取消 '{kw}'")
+        elif waiting_for_input[uid] == "collect_image_kw":
+            img_collect.pop(uid, None); img_collect_kw.pop(uid, None)
+            await update.message.reply_text('已取消')
+        waiting_for_input.pop(uid, None)
+    else:
+        await update.message.reply_text('无操作')
+
+async def cmd_addemoji(update, context):
+    """Add emoji keyword via pack link: /emo <keyword> <pack_link>"""
+    text = update.message.text
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return await update.message.reply_text("用法: /emo <关键词> <emoji包链接>\n例如: /emo 抽牌 https://t.me/addemoji/MyPack")
+    remaining = parts[1].strip().split(maxsplit=1)
+    if len(remaining) < 2:
+        return await update.message.reply_text("用法: /emo <关键词> <emoji包链接>")
+    kw, link = remaining[0], remaining[1]
+    m = re.search(r'addemoji/([a-zA-Z0-9_]+)', link)
+    sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+    if not sn: return await update.message.reply_text('无法提取 emoji 包名')
+    user_id = update.effective_user.id
+    chat = update.effective_chat
+    gid = str(chat.id) if chat and chat.type in ('group', 'supergroup') else str(user_selected_group.get(user_id, '_global'))
+    try:
+        ss = await context.bot.get_sticker_set(name=sn)
+        emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+        if not emoji_map:
+            return await update.message.reply_text(f"包 '{sn}' 中没有自定义 Emoji")
+        config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random"}
+        save_config(config)
+        emoji_cache[sn] = emoji_map; _init_queue(sn, emoji_cache, emoji_queue)
+        gname = _get_group_name(gid)
+        await update.message.reply_text(f"Emoji添加成功! [{gname}] {kw} -> {sn} ({len(emoji_map)}个)")
+    except Exception as e: await update.message.reply_text(f"失败: {e}")
+
+async def cmd_addimg(update, context):
+    """Start image keyword collection: /addimg"""
+    uid = update.effective_user.id
+    if update.effective_chat.type in ('group', 'supergroup'):
+        return await update.message.reply_text("请在私聊中使用 /addimg")
+    waiting_for_input[uid] = "collect_image_kw"
+    await update.message.reply_text("发送图片关键词名称:\n/cancel 取消")
+
+async def cmd_delyu(update, context):
+    """Universal keyword deletion: /delyu <关键词> — works for all keyword types."""
+    parts = update.message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return await update.message.reply_text("用法: /delyu <关键词>")
+    kw = parts[1].strip()
+    chat = update.effective_chat
+    gid = str(chat.id) if chat and chat.type in ('group', 'supergroup') else str(user_selected_group.get(update.effective_user.id, '_global'))
+
+    # Try each keyword type
+    types = [
+        ('贴纸', 'sticker_keywords', None),
+        ('内联', 'inline_sticker_keywords', None),
+        ('Emoji', 'emoji_keywords', None),
+        ('图片', 'image_keywords', None),
+    ]
+    for label, conf_key, _ in types:
+        kws = config.get(conf_key, {}).get(gid, {})
+        if kw in kws:
+            v = kws.pop(kw)
+            config.setdefault(conf_key, {})[gid] = kws
+            save_config(config)
+            gname = _get_group_name(gid)
+            await update.message.reply_text(f"已删除 {label} 关键词 '{kw}' [{gname}]")
+            return
+    await update.message.reply_text(f"关键词 '{kw}' 不存在")
+
+async def cmd_counter(update, context):
+    """启用/禁用计数器模式: /counter"""
+    chat = update.effective_chat
+    tid = getattr(update.message, 'message_thread_id', None)
+    key = f"{chat.id}:{tid or 0}"
+    if counter_enabled.get(key):
+        counter_enabled.pop(key)
+        counter_data.pop(key, None); counter_msg.pop(key, None)
+        await update.message.reply_text("计数器已关闭")
+    else:
+        counter_enabled[key] = True
+        await update.message.reply_text("计数器已启用\n格式: #关键词 [±]数字\n#生命 4  设值\n#生命 +2  加2\n#生命 -3  减3")
+
+async def handle_counter(update, context):
+    """处理计数器: #关键词 [±]数字  — 有±则加减，无则设值"""
+    msg = update.message
+    if not msg or not msg.text: return
+    chat = update.effective_chat
+    tid = getattr(msg, 'message_thread_id', None)
+    key = f"{chat.id}:{tid or 0}"
+    if not counter_enabled.get(key): return
+
+    text = msg.text.strip()
+    m = re.match(r'^#(\S+)\s+([+-]?\d+)$', text)
+    if not m: return
+    kw, num = m.group(1), m.group(2)
+    uid = update.effective_user.id
+    data = counter_data.setdefault(key, {}).setdefault(uid, {})
+
+    # 加减 / 设值
+    if num.startswith('+') or num.startswith('-'):
+        data[kw] = data.get(kw, 0) + int(num)
+    else:
+        data[kw] = int(num)
+
+    parts = [f"[{k} {v}]" for k, v in data.items()]
+    display = " ".join(parts)
+
+    # 构建显示
+    parts = [f"[{k} {v}]" for k, v in data.items()]
+    display = " ".join(parts)
+
+    # 编辑或发送
+    prev_msg = counter_msg.get(key, {}).get(uid)
+    if prev_msg:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat.id, message_id=prev_msg, text=display)
+            return
+        except Exception:
+            pass
+    sent = await msg.reply_text(display)
+    counter_msg.setdefault(key, {})[uid] = sent.message_id
+
+# ========== Bot group membership tracker ==========
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Track Bot being added to / removed from groups."""
+    chat = update.effective_chat
+    if chat.type not in ['group', 'supergroup']:
+        return
+
+    new = update.my_chat_member.new_chat_member
+    gid = str(chat.id)
+    known = config.setdefault('known_groups', {})
+
+    if new.status in ['member', 'administrator']:
+        known[gid] = chat.title or f"群组{gid}"
+        logger.info(f"Bot added to group: {chat.title} ({gid})")
+        save_config(config)
+    elif new.status in ['left', 'kicked'] and gid in known:
+        del known[gid]
+        logger.info(f"Bot removed from group: {chat.title} ({gid})")
+        save_config(config)
+
+# ========== Keyword handler (group-aware) ==========
+async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    user = update.effective_user; text = update.message.text; user_id = user.id
+    # Skip bot commands (handled by CommandHandlers)
+    if text.startswith('/'): return
+
+    # === 计数器模式优先 ===
+    chat = update.effective_chat
+    tid = getattr(update.message, 'message_thread_id', None)
+    key = f"{chat.id}:{tid or 0}"
+    if counter_enabled.get(key):
+        try:
+            data = counter_data.get(key, {}).get(user_id, {})
+            if data:
+                # 多个 #关键词 → 排序置顶
+                multi_match = re.match(r'^#\S+(?:\s+#\S+)+$', text.strip())
+                if multi_match:
+                    kws = re.findall(r'#(\S+)', text.strip())
+                    seen = set()
+                    ordered = [(kw, data[kw]) for kw in kws if kw in data and not (seen.add(kw) or False)]
+                    rest = [(k, v) for k, v in data.items() if k not in seen]
+                    parts = [f"[{k} {v}]" for k, v in ordered + rest]
+                    await context.bot.send_message(chat_id=chat.id, text=" ".join(parts), message_thread_id=tid)
+                    return
+
+                # 仅 #关键词 无数字 → 查看计数表
+                view_match = re.match(r'^#(\S+)$', text.strip())
+                if view_match:
+                    kw = view_match.group(1)
+                    if kw in data:
+                        parts = [f"[{k} {v}]" for k, v in data.items()]
+                        await context.bot.send_message(chat_id=chat.id, text=" ".join(parts), message_thread_id=tid)
+                        return
+
+            m = re.match(r'^#(\S+)\s+([+-]?\d+)$', text.strip())
+            if m:
+                kw, num = m.group(1), m.group(2)
+                data = counter_data.setdefault(key, {}).setdefault(user_id, {})
+                if num.startswith('+') or num.startswith('-'):
+                    data[kw] = data.get(kw, 0) + int(num)
+                else:
+                    data[kw] = int(num)
+                parts = [f"[{k} {v}]" for k, v in data.items()]
+                display = " ".join(parts)
+                # 删除旧计数表
+                prev_msg = counter_msg.get(key, {}).get(user_id)
+                if prev_msg:
+                    try: await context.bot.delete_message(chat_id=chat.id, message_id=prev_msg)
+                    except Exception: pass
+                # 发送新计数表（非回复）
+                sent = await context.bot.send_message(chat_id=chat.id, text=display, message_thread_id=tid)
+                counter_msg.setdefault(key, {})[user_id] = sent.message_id
+                return
+        except Exception as e:
+            logger.warning(f"Counter error: {e}")
+        # Non-counter text in counter mode: fall through to keyword handling
+
+    # Input interception (same as before)
+    if user_id in waiting_for_input:
+        mode = waiting_for_input.pop(user_id)
+
+        # Emoji keyword add via pack link
+        if mode.startswith("add_emoji:"):
+            chat = update.effective_chat
+            gid = str(chat.id) if chat and chat.type in ('group', 'supergroup') else str(user_selected_group.get(user_id, '_global'))
+            kw = mode.split(":", 1)[1]
+            text = text.strip()
+            # If no keyword yet (first prompt), parse both keyword and link
+            if not kw:
+                parts = text.strip().split(maxsplit=1)
+                if len(parts) < 2:
+                    waiting_for_input[user_id] = mode
+                    return await update.message.reply_text('格式: <关键词> <emoji包链接>\n例如: 抽牌 https://t.me/addemoji/MyPack\n/cancel 取消')
+                kw, link = parts[0], parts[1]
+                m = re.search(r'addemoji/([a-zA-Z0-9_]+)', link)
+                sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+            else:
+                m = re.search(r'addemoji/([a-zA-Z0-9_]+)', text)
+                sn = m.group(1) if m else text.strip().split('/')[-1].split('?')[0]
+            if not sn:
+                waiting_for_input[user_id] = mode
+                return await update.message.reply_text('请发送 emoji 包链接 (如 https://t.me/addemoji/PackName)\n/cancel 取消')
+            try:
+                ss = await context.bot.get_sticker_set(name=sn)
+                emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                if not emoji_map:
+                    return await update.message.reply_text(f"包 '{sn}' 中没有自定义 Emoji")
+                config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random"}
+                save_config(config)
+                emoji_cache[sn] = emoji_map; _init_queue(sn, emoji_cache, emoji_queue)
+                gname = _get_group_name(gid)
+                await update.message.reply_text(f"Emoji添加成功! [{gname}] {kw} -> {sn} ({len(emoji_map)}个)")
+            except Exception as e: await update.message.reply_text(f"失败: {e}")
+            return
+
+        gid = str(user_selected_group.get(user_id, '_global'))
+
+        if mode.startswith("replace:"):
+            tk = mode.split(":",1)[1]
+            # Smart detect: link → replace sticker set; keyword → replace keyword name
+            if re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', text) or text.strip().startswith('https://t.me/'):
+                m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', text)
+                sn = m.group(1) if m else text.strip().split('/')[-1].split('?')[0]
+                if not sn: return await update.message.reply_text('无法提取包名')
+                try:
+                    ss = await context.bot.get_sticker_set(name=sn); sticks = [s.file_id for s in ss.stickers]
+                    old = _get_set(tk, gid)
+                    config['sticker_keywords'].setdefault(gid,{})[tk]['set'] = sn; save_config(config)
+                    sticker_cache[sn] = sticks; _init_queue(sn, sticker_cache, sticker_queue)
+                    if old and old not in {v.get('set','') if isinstance(v,dict) else v for v in config.get('sticker_keywords',{}).get(gid,{}).values()}:
+                        all_sets = set()
+                        for gid2, kws in config.get('sticker_keywords',{}).items():
+                            for v in kws.values():
+                                all_sets.add(v.get('set','') if isinstance(v,dict) else v)
+                        if old not in all_sets:
+                            sticker_cache.pop(old,None); sticker_queue.pop(old,None)
+                    await update.message.reply_text(f"替换成功! {tk} -> {sn} ({len(sticks)}张)")
+                except Exception as e: await update.message.reply_text(f"失败: {e}")
+            else:
+                # Replace keyword name
+                new_kw = text.strip().split()[0]
+                if not new_kw or len(new_kw) > 20: return await update.message.reply_text('关键词不合法')
+                sk = config.setdefault('sticker_keywords',{}).setdefault(gid,{})
+                if new_kw in sk and new_kw != tk:
+                    return await update.message.reply_text(f'关键词 "{new_kw}" 已存在')
+                sk[new_kw] = sk.pop(tk); save_config(config)
+                await update.message.reply_text(f"关键词已改名! {tk} → {new_kw}")
+            return
+
+        elif mode == "add":
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) < 2: return await update.message.reply_text('格式: <关键词> <链接>')
+            kw, link = parts[0], parts[1]
+            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', link); sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+            if not sn: return await update.message.reply_text('无法提取包名')
+            try:
+                ss = await context.bot.get_sticker_set(name=sn); sticks = [s.file_id for s in ss.stickers]
+                config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "sequential"}
+                save_config(config)
+                sticker_cache[sn] = sticks; _init_queue(sn, sticker_cache, sticker_queue)
+                gname = _get_group_name(gid)
+                await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({len(sticks)}张)")
+            except Exception as e: await update.message.reply_text(f"失败: {e}")
+            return
+
+        elif mode.startswith("replace_inline:"):
+            tk = mode.split(":",1)[1]
+            if re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', text) or text.strip().startswith('https://t.me/'):
+                m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', text)
+                sn = m.group(1) if m else text.strip().split('/')[-1].split('?')[0]
+                if not sn: return await update.message.reply_text('无法提取包名')
+                try:
+                    ss = await context.bot.get_sticker_set(name=sn); sticks = [s.file_id for s in ss.stickers]
+                    old = _inline_get_set(tk, gid)
+                    config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[tk]['set'] = sn; save_config(config)
+                    inline_cache[sn] = sticks; _init_queue(sn, inline_cache, inline_queue)
+                    inline_hand[sn] = {}
+                    _save_hand()
+                    await update.message.reply_text(f"内联替换成功! {tk} -> {sn} ({len(sticks)}张)")
+                except Exception as e: await update.message.reply_text(f"失败: {e}")
+            else:
+                new_kw = text.strip().split()[0]
+                if not new_kw or len(new_kw) > 20: return await update.message.reply_text('关键词不合法')
+                ik = config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})
+                if new_kw in ik and new_kw != tk:
+                    return await update.message.reply_text(f'关键词 "{new_kw}" 已存在')
+                ik[new_kw] = ik.pop(tk); save_config(config)
+                await update.message.reply_text(f"关键词已改名! {tk} → {new_kw}")
+            return
+
+        elif mode.startswith("replace_emoji:"):
+            tk = mode.split(":", 1)[1]
+            chat = update.effective_chat
+            em_gid = str(chat.id) if chat and chat.type in ('group', 'supergroup') else str(user_selected_group.get(user_id, '_global'))
+            m = re.search(r'addemoji/([a-zA-Z0-9_]+)', text)
+            sn = m.group(1) if m else text.strip().split('/')[-1].split('?')[0]
+            if not sn: return await update.message.reply_text('无法提取包名')
+            try:
+                ss = await context.bot.get_sticker_set(name=sn)
+                emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                if not emoji_map:
+                    return await update.message.reply_text(f"包 '{sn}' 中没有自定义 Emoji")
+                old = _emoji_get_set(tk, em_gid)
+                config.setdefault('emoji_keywords', {}).setdefault(em_gid, {})[tk]['set'] = sn; save_config(config)
+                emoji_cache[sn] = emoji_map; _init_queue(sn, emoji_cache, emoji_queue)
+                if old and old not in {v.get('set', '') if isinstance(v, dict) else v for v in config.get('emoji_keywords', {}).get(em_gid, {}).values()}:
+                    all_es = set()
+                    for gid2, kws in config.get('emoji_keywords', {}).items():
+                        for v in kws.values():
+                            all_es.add(v.get('set', '') if isinstance(v, dict) else v)
+                    if old not in all_es:
+                        emoji_cache.pop(old, None); emoji_queue.pop(old, None)
+                await update.message.reply_text(f"Emoji替换成功! {tk} -> {sn} ({len(emoji_map)}个)")
+            except Exception as e: await update.message.reply_text(f"失败: {e}")
+            return
+
+        elif mode == "collect_image_kw":
+            kw = text.strip()
+            if not kw or len(kw) > 20:
+                waiting_for_input[user_id] = mode
+                return await update.message.reply_text('关键词不合法, 1-20字。重试或 /cancel')
+            waiting_for_input[user_id] = "collect_image"
+            img_collect_kw[user_id] = kw
+            img_collect.setdefault(user_id, [])
+            await update.message.reply_text(f"关键词: {kw}\n发送图片添加到 '{kw}'，组合发送的和单张都会加入。发 /cancel 完成。")
+
+        elif mode == "collect_image":
+            # Text while collecting — if /cancel we handle below
+            pass  # non-cancel text during collection is ignored, photos handled by photo handler
+
+        elif mode.startswith("add_image:"):
+            # Legacy: kept for backward compat
+            return
+
+        elif mode.startswith("replace_image:"):
+            return  # Legacy, no longer supported
+
+        elif mode == "add_inline":
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) < 2: return await update.message.reply_text('格式: <关键词> <链接>')
+            kw, link = parts[0], parts[1]
+            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', link); sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+            if not sn: return await update.message.reply_text('无法提取包名')
+            try:
+                ss = await context.bot.get_sticker_set(name=sn); sticks = [s.file_id for s in ss.stickers]
+                config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "limited"}
+                save_config(config)
+                inline_cache[sn] = sticks; _init_queue(sn, inline_cache, inline_queue)
+                inline_hand[sn] = {}
+                _save_hand()
+                gname = _get_group_name(gid)
+                await update.message.reply_text(f"内联添加成功! [{gname}] {kw} -> {sn} ({len(sticks)}张)")
+            except Exception as e: await update.message.reply_text(f"失败: {e}")
+            return
+
+    # -- Index send: 1-2-3/  or  1-2-3 (play cards from hand by position)
+    idx_match = re.match(r'^(\d+(?:-\d+)+)(/?)$', text.strip())
+    range_match = re.match(r'^(\d+)~(\d+)(/?)$', text.strip())
+    if idx_match or range_match:
+        uid = user_id
+        for sn, users in inline_hand.items():
+            if uid in users and users[uid]:
+                hand = users[uid]
+                if range_match:
+                    start, end = int(range_match.group(1)), int(range_match.group(2))
+                    if start > end: start, end = end, start
+                    indices = list(range(start, end + 1))
+                    send_s = (range_match.group(3) == '/')
+                else:
+                    indices = [int(x) for x in idx_match.group(1).split('-')]
+                    send_s = (idx_match.group(2) == '/')
+                played = []
+                for idx in sorted(set(indices), reverse=True):
+                    i = idx - 1
+                    if 0 <= i < len(hand):
+                        played.insert(0, hand.pop(i))
+                if send_s:
+                    for fid in played:
+                        kwargs = {"chat_id": update.effective_chat.id, "sticker": fid}
+                        tid = getattr(update.message, 'message_thread_id', None)
+                        if tid: kwargs["message_thread_id"] = tid
+                        try: await context.bot.send_sticker(**kwargs)
+                        except Exception as se: logger.warning(f"Play fail: {se}")
+                # Move to discard for limited mode
+                if _is_limited_set(sn):
+                    dc = inline_discard.setdefault(sn, {}).setdefault(uid, [])
+                    dc.extend(played)
+                    _save_json(DISCARD_FILE, inline_discard)
+                if not hand:
+                    del users[uid]
+                _save_hand()
+                await update.message.reply_text(f"已打出 {len(played)} 张  |  手牌 {len(hand)} 张")
+                return
+        return
+
+    # -- Group-aware keyword detection --
+    if not config.get('enabled_features',{}).get('keyword_reply', True): return
+
+    for keyword, reply in config.get('keywords',{}).items():
+        if keyword in text.lower():
+            await update.message.reply_text(reply); return
+
+    msg_lower = text.lower()
+
+    # Resolve group context for keyword matching
+    chat = update.effective_chat
+    chat_group_id = None
+    if chat and chat.type in ['group', 'supergroup']:
+        chat_group_id = str(chat.id)
+        # Auto-register
+        known = config.setdefault('known_groups', {})
+        if chat_group_id not in known:
+            known[chat_group_id] = chat.title or f"群组{chat_group_id}"
+            save_config(config)
+
+    def _match_inline_keywords(check_gid):
+        """Match inline keywords for a specific group, returns (keyword, count, sn, silent, has_slash, peek, discard) or None."""
+        ik = _get_ik(check_gid)
+        for keyword, v in ik.items():
+            if keyword not in msg_lower: continue
+            count = 1; silent = True; has_slash = False; peek = False; discard = False; parts = text.strip().split()
+            if len(parts) >= 2 and parts[0].lower() == keyword.lower():
+                last_part = parts[-1]
+                if last_part.endswith('d'):
+                    silent = False; has_slash = True
+                    num_str = last_part.rstrip('d')
+                    try: count = max(0, min(int(num_str), 50))
+                    except ValueError: count = 1
+                elif last_part.endswith('w'):
+                    silent = False; has_slash = True; peek = True
+                    num_str = last_part.rstrip('w')
+                    try: count = max(1, min(int(num_str), 50))
+                    except ValueError: count = 1
+                elif last_part.endswith('f'):
+                    silent = False; has_slash = True; discard = True
+                    num_str = last_part.rstrip('f')
+                    try: count = max(1, min(int(num_str), 50))
+                    except ValueError: count = 1
+                elif last_part == '/':
+                    silent = False; has_slash = True; count = 1
+                else:
+                    try: count = max(0, min(int(parts[-1]), 50))
+                    except ValueError: count = 1
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            return keyword, count, sn, silent, has_slash, peek, discard
+        return None
+
+    def _match_sticker_keywords(check_gid):
+        """Match sticker keywords for a specific group, returns (keyword, count, sn, peek) or None."""
+        sk = _get_sk(check_gid)
+        for keyword, v in sk.items():
+            if keyword not in msg_lower: continue
+            count = 1; peek = False; parts = text.strip().split()
+            if len(parts) >= 2 and parts[0].lower() == keyword.lower():
+                if parts[1].endswith('w'):
+                    try: count = max(1, min(int(parts[1][:-1]), 50)); peek = True
+                    except ValueError: pass
+                else:
+                    try: count = max(0, min(int(parts[-1]), 50))
+                    except ValueError: count = 1
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            return keyword, count, sn, peek
+        return None
+
+    # Priority: chat group first, then _global
+    search_groups = [chat_group_id, '_global'] if chat_group_id else ['_global']
+
+    # === Image keywords (Telegram file_ids, queue-based like sticker) ===
+    def _match_image_keywords(check_gid):
+        ik = _get_img_kw(check_gid)
+        for keyword, v in ik.items():
+            if keyword.lower() not in msg_lower: continue
+            count = 1; peek = False; parts = text.strip().split()
+            if len(parts) >= 2 and parts[0].lower() == keyword.lower():
+                if parts[1].endswith('w'):
+                    try: count = max(1, min(int(parts[1][:-1]), 50)); peek = True
+                    except ValueError: pass
+                else:
+                    try: count = max(0, min(int(parts[-1]), 50))
+                    except ValueError: count = 1
+            return keyword, count, peek
+        return None
+
+    for gid in search_groups:
+        result = _match_image_keywords(gid)
+        if not result: continue
+        keyword, count, peek = result
+        key = _img_kw_key(gid, keyword)
+        img_mode = _img_get_mode(keyword, gid)
+        img_files = _img_get_files(keyword, gid)
+        if not img_files:
+            await update.message.reply_text(f"'{keyword}' 没有图片, 请重新添加"); return
+
+        if peek:
+            sample = random.sample(img_files, min(count, len(img_files)))
+            for fid in sample:
+                kwargs = {"chat_id": update.effective_chat.id, "photo": fid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_photo(**kwargs)
+                except Exception as se: logger.warning(f"Image peek fail: {se}")
+            await update.message.reply_text(f"预览 {len(sample)} 张  |  牌库 {len(img_files)} 张")
+            return
+
+        # Ensure cache has latest from config
+        img_cache[key] = list(img_files)
+        if key not in img_queue or not img_queue.get(key):
+            _init_queue(key, img_cache, img_queue)
+
+        if count == 0:
+            if img_mode == 'limited':
+                # Limited: recycle all discard from all users
+                all_discard = []
+                for uid2, cards in img_discard.get(key, {}).items():
+                    all_discard.extend(cards)
+                random.shuffle(all_discard)
+                if all_discard:
+                    img_queue[key] = all_discard
+                    await update.message.reply_text(
+                        f"全部图片弃牌 {len(all_discard)} 张洗入牌库  |  牌库 {len(all_discard)} 张"
+                    )
+                else:
+                    _init_queue(key, img_cache, img_queue)
+                    await update.message.reply_text(f"图片牌库已重置  |  牌库 {len(img_files)} 张")
+                img_discard[key] = {}
+            else:
+                # Non-limited: recycle current user's discard, re-shuffle
+                my_discard = img_discard.get(key, {}).pop(user_id, [])
+                if my_discard:
+                    # Put discard back into cache set
+                    new_cache = list(img_files) + my_discard
+                    img_cache[key] = new_cache
+                    _init_queue(key, img_cache, img_queue)
+                    await update.message.reply_text(
+                        f"弃牌 {len(my_discard)} 张已洗入  |  牌库 {len(new_cache)} 张"
+                    )
+                else:
+                    _init_queue(key, img_cache, img_queue)
+                    await update.message.reply_text(f"图片牌库已重新洗混! {keyword} ({len(img_files)}张)")
+            return
+
+        drawn = 0
+        for i in range(count):
+            queue = img_queue.get(key)
+            my_dc = img_discard.get(key, {}).get(user_id, [])
+            if not queue:
+                if img_mode == 'limited': break
+                # Re-init from cache minus user's discard
+                remaining = [f for f in img_files if f not in my_dc]
+                if not remaining:
+                    await update.message.reply_text("牌库已空, 所有图片都在弃牌堆。发送 关键词 0 洗入。")
+                    break
+                img_cache[key] = list(img_files)  # Keep original for total count
+                img_queue[key] = random.sample(remaining, len(remaining))
+                queue = img_queue.get(key)
+            if not queue: break
+            # Skip discarded images
+            fid = None
+            while queue:
+                candidate = queue.pop()
+                if candidate not in my_dc:
+                    fid = candidate; break
+                # Discarded: put back at end
+                queue.insert(0, candidate)
+                # Check if all remaining are discarded
+                if all(q in my_dc for q in queue):
+                    queue.clear()
+                    break
+            if fid is None:
+                await update.message.reply_text("牌库已空, 所有图片都在弃牌堆。发送 关键词 0 洗入。")
+                break
+            if img_mode == 'limited':
+                img_discard.setdefault(key, {}).setdefault(user_id, []).append(fid)
+            try:
+                kwargs = {"chat_id": update.effective_chat.id, "photo": fid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                await context.bot.send_photo(**kwargs)
+                drawn += 1
+            except Exception as se: logger.warning(f"Image send fail: {se}")
+        if drawn:
+            remain = len(img_queue.get(key, []))
+            total = len(img_cache.get(key, []))
+            parts = [f"图片抽牌 {drawn} 张", f"牌库 {remain}/{total} 张"]
+            if img_mode == 'limited' and remain == 0:
+                parts.append(f"→ 发送 {keyword} 0 洗回弃牌")
+            await update.message.reply_text("  |  ".join(parts))
+        elif img_mode == 'limited':
+            await update.message.reply_text(f"图片牌库已空  →  发送 {keyword} 0 洗回弃牌")
+        return
+
+    # === Emoji keywords (pack-based, same as sticker) ===
+    def _match_emoji_keywords(check_gid):
+        ek = _get_ek(check_gid)
+        for keyword, v in ek.items():
+            if keyword not in msg_lower: continue
+            count = 1; peek = False; parts = text.strip().split()
+            if len(parts) >= 2 and parts[0].lower() == keyword.lower():
+                if parts[1].endswith('w'):
+                    try: count = max(1, min(int(parts[1][:-1]), 50)); peek = True
+                    except ValueError: pass
+                else:
+                    try: count = max(0, min(int(parts[-1]), 50))
+                    except ValueError: count = 1
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            return keyword, count, sn, peek
+        return None
+
+    for gid in search_groups:
+        result = _match_emoji_keywords(gid)
+        if not result: continue
+        keyword, count, sn, peek = result
+        emoji_mode = _emoji_get_mode(keyword, gid)
+
+        if count == 0:
+            if emoji_mode == 'limited':
+                all_discard = []
+                for uid, cards in emoji_discard.get(sn, {}).items():
+                    all_discard.extend(cards)
+                random.shuffle(all_discard)
+                if all_discard:
+                    emoji_queue[sn] = all_discard
+                    user_count = len(emoji_discard.get(sn, {}))
+                    await update.message.reply_text(
+                        f"全部Emoji弃牌 {len(all_discard)} 张洗入牌库  |  "
+                        f"牌库 {len(all_discard)} 张  |  "
+                        f"已清空 {user_count} 人的手牌"
+                    )
+                else:
+                    _init_queue(sn, emoji_cache, emoji_queue)
+                    await update.message.reply_text(f"Emoji牌库已重置  |  牌库 {len(emoji_cache[sn])} 张")
+                emoji_discard[sn] = {}
+                _save_json(EMOJI_QUEUE_FILE, emoji_queue)
+                _save_json(EMOJI_DISCARD_FILE, emoji_discard)
+            else:
+                _init_queue(sn, emoji_cache, emoji_queue)
+                _save_json(EMOJI_QUEUE_FILE, emoji_queue)
+                await update.message.reply_text(f"Emoji牌库已重新洗混! {keyword} -> {sn} ({len(emoji_cache.get(sn,[]))}张)")
+            return
+
+        emoji_map = emoji_cache.get(sn)
+        if not emoji_map:
+            try:
+                ss = await context.bot.get_sticker_set(name=sn)
+                emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                emoji_cache[sn] = emoji_map
+            except Exception: continue
+        if not emoji_map: break
+
+        if peek:
+            eids = list(emoji_map.keys())
+            sample = random.sample(eids, min(count, len(eids)))
+            chars = []; entities = []; offset = 0
+            for eid in sample:
+                ch = emoji_map.get(eid, '\u2764')
+                char_len = len(ch.encode('utf-16-le')) // 2
+                chars.append(ch)
+                entities.append(MessageEntity(type='custom_emoji', offset=offset, length=char_len, custom_emoji_id=eid))
+                offset += char_len
+            try:
+                kwargs = {"chat_id": update.effective_chat.id, "text": ''.join(chars), "entities": entities}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                await context.bot.send_message(**kwargs)
+            except Exception as se: logger.warning(f"Emoji peek fail: {se}")
+            await update.message.reply_text(f"预览 {len(sample)} 张  |  牌库 {len(eids)} 张")
+            return
+
+        drawn = 0
+        chars = []    # 拼接的 emoji 字符
+        entities = [] # 对应的 MessageEntity 列表
+        for i in range(count):
+            queue = emoji_queue.get(sn)
+            if not queue:
+                if emoji_mode == 'limited':
+                    break
+                try:
+                    ss = await context.bot.get_sticker_set(name=sn)
+                    emoji_cache[sn] = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                except Exception: break
+                _init_queue(sn, emoji_cache, emoji_queue); queue = emoji_queue.get(sn)
+            if not queue: break
+            eid = queue.pop()
+            emoji_char = emoji_map.get(eid, '\u2764')  # fallback to ❤ if not found
+            if emoji_mode == 'limited':
+                emoji_discard.setdefault(sn, {}).setdefault(user_id, []).append(eid)
+            # 记录 offset（UTF-16 编码下的偏移量）
+            offset = sum(len(c.encode('utf-16-le')) // 2 for c in chars)
+            char_len = len(emoji_char.encode('utf-16-le')) // 2
+            chars.append(emoji_char)
+            entities.append(MessageEntity(type='custom_emoji', offset=offset, length=char_len, custom_emoji_id=eid))
+            drawn += 1
+        # 一次性发送所有 emoji
+        if drawn:
+            try:
+                kwargs = {"chat_id": update.effective_chat.id, "text": ''.join(chars), "entities": entities}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                await context.bot.send_message(**kwargs)
+            except Exception as se:
+                logger.warning(f"Emoji batch send fail: {se}")
+        if drawn:
+            _save_json(EMOJI_QUEUE_FILE, emoji_queue)
+            if emoji_mode == 'limited':
+                _save_json(EMOJI_DISCARD_FILE, emoji_discard)
+        return
+
+    for gid in search_groups:
+        result = _match_inline_keywords(gid)
+        if not result: continue
+        keyword, count, sn, silent, has_slash, peek, discard = result
+        inline_mode = _inline_get_mode(keyword, gid)
+
+        if peek:
+            stickers = inline_cache.get(sn)
+            if not stickers: continue
+            sample = random.sample(stickers, min(count, len(stickers)))
+            for fid in sample:
+                kwargs = {"chat_id": update.effective_chat.id, "sticker": fid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_sticker(**kwargs)
+                except Exception as se: logger.warning(f"Inline peek fail: {se}")
+            await update.message.reply_text(f"预览 {len(sample)} 张  |  牌库 {len(stickers)} 张")
+            return
+
+        if discard:
+            # Discard N cards from top of deck into discard pile
+            stickers = inline_cache.get(sn)
+            if not stickers:
+                try:
+                    ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; inline_cache[sn] = stickers
+                except Exception: continue
+            if not stickers: break
+            queue = inline_queue.get(sn)
+            if not queue:
+                _init_queue(sn, inline_cache, inline_queue); queue = inline_queue.get(sn)
+            if not queue: break
+            nd = min(count, len(queue))
+            folded = []
+            for i in range(nd):
+                fid = queue.pop()
+                folded.append(fid)
+                kwargs = {"chat_id": update.effective_chat.id, "sticker": fid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_sticker(**kwargs)
+                except Exception as se: logger.warning(f"Discard send fail: {se}")
+            dc = inline_discard.setdefault(sn, {}).setdefault(user_id, [])
+            dc.extend(folded)
+            _save_json(INLINE_QUEUE_FILE, inline_queue)
+            _save_json(DISCARD_FILE, inline_discard)
+            remain = len(queue)
+            await update.message.reply_text(
+                f"弃牌 {nd} 张  |  弃牌堆 {len(dc)} 张  |  牌库 {remain} 张"
+            )
+            return
+
+        if count == 0:
+            if inline_mode == 'limited':
+                if has_slash:
+                    # 关键词 0/ — global reset: all discards + all hands
+                    all_discard = []
+                    for uid, cards in inline_discard.get(sn, {}).items():
+                        all_discard.extend(cards)
+                    random.shuffle(all_discard)
+                    if all_discard:
+                        inline_queue[sn] = all_discard
+                        user_count = len(inline_discard.get(sn, {}))
+                        await update.message.reply_text(
+                            f"全部弃牌 {len(all_discard)} 张洗入牌库  |  "
+                            f"牌库 {len(all_discard)} 张  |  "
+                            f"已清空 {user_count} 人的手牌"
+                        )
+                    else:
+                        _init_queue(sn, inline_cache, inline_queue)
+                        await update.message.reply_text(
+                            f"牌库已重置  |  牌库 {len(inline_cache[sn])} 张"
+                        )
+                    inline_discard[sn] = {}
+                    inline_hand[sn] = {}
+                    _save_json(INLINE_QUEUE_FILE, inline_queue)
+                    _save_json(DISCARD_FILE, inline_discard)
+                    _save_hand()
+                else:
+                    # 关键词 0 — personal: only user's own discard back, hand untouched
+                    my_discard = inline_discard.get(sn, {}).pop(user_id, [])
+                    random.shuffle(my_discard)
+                    if my_discard:
+                        # Append to existing queue
+                        current_queue = inline_queue.get(sn, [])
+                        current_queue.extend(my_discard)
+                        inline_queue[sn] = current_queue
+                        my_hand = len(inline_hand.get(sn, {}).get(user_id, []))
+                        await update.message.reply_text(
+                            f"你的弃牌 {len(my_discard)} 张洗入牌库  |  "
+                            f"牌库 {len(current_queue)} 张  |  手牌 {my_hand} 张 (未动)"
+                        )
+                    else:
+                        my_hand = len(inline_hand.get(sn, {}).get(user_id, []))
+                        await update.message.reply_text(
+                            f"你没有弃牌  |  牌库 {len(inline_queue.get(sn, []))} 张  |  手牌 {my_hand} 张"
+                        )
+                    _save_json(INLINE_QUEUE_FILE, inline_queue)
+                    _save_json(DISCARD_FILE, inline_discard)
+            else:
+                _init_queue(sn, inline_cache, inline_queue); _save_json(INLINE_QUEUE_FILE, inline_queue)
+                inline_hand[sn] = {}
+                _save_hand()
+                await update.message.reply_text(f"手牌已清空  |  牌库 {len(inline_cache[sn])} 张已恢复")
+            return
+
+        stickers = inline_cache.get(sn)
+        if not stickers:
+            try:
+                ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; inline_cache[sn] = stickers
+            except Exception: continue
+        if not stickers: break
+
+        drawn = []
+        uid = user_id
+        for i in range(count):
+            queue = inline_queue.get(sn)
+            if not queue:
+                if inline_mode == 'limited':
+                    break  # Deck exhausted, stop
+                try:
+                    ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; inline_cache[sn] = stickers
+                except Exception: break
+                _init_queue(sn, inline_cache, inline_queue); queue = inline_queue.get(sn)
+            if not queue: break
+            sid = queue.pop(); drawn.append(sid)
+            inline_hand.setdefault(sn, {}).setdefault(uid, []).append(sid)
+            if not silent:
+                kwargs = {"chat_id": update.effective_chat.id, "sticker": sid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_sticker(**kwargs)
+                except Exception as se: logger.warning(f"Inline send fail: {se}")
+        # Sort hand by original sticker pack order (only if sort is enabled)
+        if drawn and sn in inline_hand and uid in inline_hand[sn]:
+            if _inline_get_sort(keyword, gid):
+                order_map = {fid: idx for idx, fid in enumerate(inline_cache.get(sn, []))}
+                inline_hand[sn][uid].sort(key=lambda fid: order_map.get(fid, 999999))
+        _save_json(INLINE_QUEUE_FILE, inline_queue)
+        _save_hand()
+        remain = len(inline_queue.get(sn, []))
+        if drawn:
+            my_hand = len(inline_hand.get(sn, {}).get(uid, []))
+            parts = [f"抽牌 {len(drawn)} 张", f"手牌 {my_hand} 张"]
+            if not silent:
+                parts.append("发送")
+            if inline_mode == 'limited':
+                my_dc = len(inline_discard.get(sn, {}).get(uid, []))
+                total_dc = sum(len(v) for v in inline_discard.get(sn, {}).values())
+                parts.append(f"牌库 {remain} 张")
+                if my_dc > 0:
+                    dc_text = f"弃牌 {my_dc} 张" if total_dc == my_dc else f"弃牌 {my_dc}/{total_dc} 张"
+                    parts.append(dc_text)
+                if remain == 0:
+                    parts.append(f"→ 发送 {keyword} 0 洗回弃牌")
+            else:
+                total = len(inline_cache.get(sn, []))
+                parts.append(f"牌库 {remain}/{total} 张")
+            await update.message.reply_text("  |  ".join(parts))
+        elif inline_mode == 'limited':
+            my_dc = len(inline_discard.get(sn, {}).get(uid, []))
+            total_dc = sum(len(v) for v in inline_discard.get(sn, {}).values())
+            dc_text = f"弃牌 {my_dc} 张" if total_dc == my_dc else f"弃牌 {my_dc}/{total_dc} 张"
+            await update.message.reply_text(
+                f"牌库已空  |  手牌 {len(inline_hand.get(sn, {}).get(uid, []))} 张  |  "
+                f"{dc_text}  →  发送 {keyword} 0 洗回弃牌 (发送 {keyword} 0/ 全局重置)"
+            )
+        return
+
+    # === Main sticker keywords ===
+    for gid in search_groups:
+        result = _match_sticker_keywords(gid)
+        if not result: continue
+        keyword, count, sn, peek = result
+
+        if count == 0:
+            _init_queue(sn, sticker_cache, sticker_queue); _save_json(QUEUE_FILE, sticker_queue)
+            await update.message.reply_text(f"牌库已重新洗混! {keyword} -> {sn} ({len(sticker_cache.get(sn,[]))}张)")
+            return
+
+        stickers = sticker_cache.get(sn)
+        if not stickers:
+            try:
+                ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; sticker_cache[sn] = stickers
+            except Exception: continue
+        if not stickers: break
+
+        if peek:
+            # Preview mode: randomly pick from cache, don't modify queue
+            sample = random.sample(stickers, min(count, len(stickers)))
+            for sid in sample:
+                kwargs = {"chat_id": update.effective_chat.id, "sticker": sid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_sticker(**kwargs)
+                except Exception as se: logger.warning(f"Peek fail: {se}")
+            total = len(stickers)
+            await update.message.reply_text(f"预览 {len(sample)} 张  |  牌库 {total} 张")
+            return
+
+        for i in range(count):
+            use_random = _get_random(keyword, gid)
+            if use_random:
+                sid = random.choice(stickers)
+            else:
+                queue = sticker_queue.get(sn)
+                if not queue:
+                    try:
+                        ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; sticker_cache[sn] = stickers
+                    except Exception: break
+                    _init_queue(sn, sticker_cache, sticker_queue); queue = sticker_queue.get(sn)
+                if not queue: break
+                sid = queue.pop(); _save_json(QUEUE_FILE, sticker_queue)
+            kwargs = {"chat_id": update.effective_chat.id, "sticker": sid}
+            tid = getattr(update.message, 'message_thread_id', None)
+            if tid: kwargs["message_thread_id"] = tid
+            try: await context.bot.send_sticker(**kwargs)
+            except Exception as se: logger.warning(f"Send fail: {se}")
+        return
+
+# ========== Inline query ==========
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.inline_query.query.strip().lower()
+    uid = update.inline_query.from_user.id
+
+    # Empty query: show all sets' hands merged
+    if not q:
+        all_results = []
+        for sn, users in inline_hand.items():
+            hand = users.get(uid, [])
+            if not hand: continue
+            for i, fid in enumerate(hand[:50]):
+                all_results.append(InlineQueryResultCachedSticker(
+                    id=f"h_{sn}_{i:03d}", sticker_file_id=fid))
+        if all_results:
+            try:
+                await update.inline_query.answer(all_results[:50], cache_time=1)
+            except Exception as e:
+                logger.warning(f"Inline answer expired: {e}")
+        return
+
+    # Search all groups for inline keywords
+    for gid, kws in config.get('inline_sticker_keywords', {}).items():
+        for keyword, v in kws.items():
+            if keyword.lower() not in q: continue
+            sn = v.get('set', '') if isinstance(v, dict) else v
+            hand = inline_hand.get(sn, {}).get(uid, [])
+            if not hand:
+                try:
+                    await update.inline_query.answer([], cache_time=1,
+                        switch_pm_text="你的手牌为空", switch_pm_parameter="empty")
+                except Exception: pass
+                return
+            results = [InlineQueryResultCachedSticker(id=f"h_{sn}_{i:03d}", sticker_file_id=fid)
+                       for i, fid in enumerate(hand[:50])]
+            try:
+                await update.inline_query.answer(results, cache_time=1)
+            except Exception as e:
+                logger.warning(f"Inline answer expired: {e}")
+            return
+
+# ========== Chosen inline result ==========
+async def chosen_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result_id = update.chosen_inline_result.result_id
+    uid = update.chosen_inline_result.from_user.id
+    parts = result_id.split('_', 2)
+    if len(parts) < 3: return
+    sn = parts[1]
+    user_hand = inline_hand.get(sn, {}).get(uid, [])
+    if not user_hand: return
+    try:
+        idx = int(parts[2])
+        if idx < len(user_hand):
+            played = user_hand.pop(idx)
+            if _is_limited_set(sn):
+                inline_discard.setdefault(sn, {}).setdefault(uid, []).append(played)
+                _save_json(DISCARD_FILE, inline_discard)
+                logger.info(f"Card discarded by {uid} to '{sn}': {len(inline_discard[sn][uid])} in discard")
+    except: pass
+    inline_hand.setdefault(sn, {})[uid] = user_hand
+    _save_hand()
+    logger.info(f"Inline played from '{sn}' by {uid}: hand now {len(user_hand)}")
+
+# ========== Sticker sent handler ==========
+async def handle_sticker_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sticker = update.message.sticker
+    if not sticker or not sticker.file_id: return
+    fid = sticker.file_id
+    uid = update.message.from_user.id
+    for sn, users in inline_hand.items():
+        if uid in users and fid in users[uid]:
+            users[uid].remove(fid)
+            if not users[uid]: del users[uid]
+            if _is_limited_set(sn):
+                inline_discard.setdefault(sn, {}).setdefault(uid, []).append(fid)
+                _save_json(DISCARD_FILE, inline_discard)
+                logger.info(f"Sticker discarded by {uid} to '{sn}': {len(inline_discard[sn][uid])} in discard")
+            _save_hand()
+            logger.info(f"Sticker played from {uid}'s hand '{sn}': {len(users.get(uid,[]))} remaining")
+            return
+
+# ========== Photo handler for image keyword collection ==========
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages during image keyword collection."""
+    uid = update.effective_user.id
+    if uid not in waiting_for_input or waiting_for_input[uid] != "collect_image":
+        return
+    # Get largest photo (best quality)
+    photo = update.message.photo[-1]
+    img_collect.setdefault(uid, []).append(photo.file_id)
+    total = len(img_collect[uid])
+    kw = img_collect_kw.get(uid, '?')
+    await update.message.reply_text(f"'{kw}': 已收集 {total} 张, 继续发送或 /cancel")
+
+# ========== Return / discard handler (回复 d / f) ==========
+async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """d: 贴纸回收至手牌 / 图片回收至牌库；f: 图片弃置"""
+    msg = update.message
+    if not msg or msg.text is None:
+        return
+    action = msg.text.strip().lower()
+    if action not in ('d', 'f'):
+        return
+    uid = update.effective_user.id
+    reply = msg.reply_to_message
+    if not reply:
+        return
+
+    # === Photo ===
+    if reply.photo and reply.photo:
+        fid = reply.photo[-1].file_id
+        if not (getattr(reply, 'via_bot', None) or (reply.from_user and reply.from_user.is_bot)):
+            return
+        for gid_str, kws in config.get('image_keywords', {}).items():
+            for kw, v in kws.items():
+                files = v.get('files', []) if isinstance(v, dict) else []
+                if fid in files:
+                    key = _img_kw_key(gid_str, kw)
+                    if action == 'f':
+                        img_discard.setdefault(key, {}).setdefault(uid, []).append(fid)
+                        dc = img_discard[key][uid]
+                        await msg.reply_text(f"已弃置  |  弃牌堆 {len(dc)} 张")
+                    else:  # d → recycle
+                        dc = img_discard.get(key, {}).get(uid, [])
+                        if fid in dc:
+                            dc.remove(fid)
+                            if not dc: del img_discard[key][uid]
+                        await msg.reply_text(f"已回收至牌库  |  弃牌堆 {len(img_discard.get(key, {}).get(uid, []))} 张")
+                    return
+        await msg.reply_text("该图片不在任何图片牌库中。")
+        return
+
+    # === Sticker: d → recycle to inline hand ===
+    if action != 'd':
+        return
+    if not reply.sticker or not reply.sticker.file_id:
+        await msg.reply_text("请回复一条内联贴纸消息来回收。")
+        return
+    if not (getattr(reply, 'via_bot', None) or (reply.from_user and reply.from_user.is_bot)):
+        await msg.reply_text("只能回收内联贴纸。")
+        return
+
+    fid = reply.sticker.file_id
+
+    for sn, users in inline_discard.items():
+        if uid in users and fid in users[uid]:
+            users[uid].remove(fid)
+            if not users[uid]: del users[uid]
+            inline_hand.setdefault(sn, {}).setdefault(uid, []).append(fid)
+            _save_hand()
+            _save_json(DISCARD_FILE, inline_discard)
+            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(inline_hand[sn][uid])} 张")
+            return
+
+    for sn, stickers in inline_cache.items():
+        if fid in stickers:
+            inline_hand.setdefault(sn, {}).setdefault(uid, []).append(fid)
+            _save_hand()
+            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(inline_hand[sn][uid])} 张")
+            return
+
+    await msg.reply_text("该贴纸不在任何内联牌库中。")
+
+
+# ========== Button callbacks ==========
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    user = query.from_user; user_id = user.id; adm = user_id in config.get('admin_ids',[])
+
+    # Resolve management group
+    gid = user_selected_group.get(user_id, '_global')
+
+    if query.data == 'select_group':
+        common = user_common_groups.get(user_id, {})
+        if common:
+            count_text = f"共 {len(common)} 个共同群组"
+        else:
+            count_text = "暂未找到共同群组（请先将 Bot 加入群组）"
+        await query.edit_message_text(
+            f"选择要管理的群组\n(当前: {_get_group_name(gid)})\n{count_text}:",
+            reply_markup=_build_group_select_keyboard(user_id, common)
+        )
+
+    elif query.data == 'manage_keywords':
+        """关键词管理子菜单"""
+        gname = _get_group_name(gid)
+        await query.edit_message_text(
+            f"[{gname}] 关键词管理\n\n管理贴纸、符号、内联、图片关键词。",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("贴纸", callback_data='list_sticker'),
+                 InlineKeyboardButton("符号", callback_data='list_emoji')],
+                [InlineKeyboardButton("图片", callback_data='list_image')],
+                [InlineKeyboardButton("内联模式", callback_data='list_inline')],
+                [InlineKeyboardButton("返回主菜单", callback_data='back_to_start')],
+            ])
+        )
+
+    elif query.data.startswith('setgroup_'):
+        new_gid = query.data.replace('setgroup_', '', 1)
+        user_selected_group[user_id] = new_gid
+        # Back to main menu
+        text, markup = _show_main_menu_text(user, new_gid)
+        await query.edit_message_text(text, reply_markup=markup)
+
+    elif query.data.startswith('group_page_'):
+        page = int(query.data.replace('group_page_', '', 1))
+        common = user_common_groups.get(user_id, {})
+        if common:
+            count_text = f"共 {len(common)} 个共同群组"
+        else:
+            count_text = "暂未找到共同群组"
+        await query.edit_message_text(
+            f"选择要管理的群组\n(当前: {_get_group_name(gid)})\n{count_text}:",
+            reply_markup=_build_group_select_keyboard(user_id, common, page)
+        )
+
+    elif query.data == 'list_inline':
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        sk = _get_ik(gid)
+        gname = _get_group_name(gid)
+        if not sk:
+            return await query.edit_message_text(
+                f"[{gname}] 还没有内联关键词.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加内联关键词", callback_data='add_inline'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        kb = _build_list_keyboard(inline=True, group_id=gid)
+        kb.insert(-1, [InlineKeyboardButton("添加内联关键词", callback_data='add_inline')])
+        await query.edit_message_text(f"[{gname}] 内联模式关键词:\n抽牌加入手牌, inline打出手牌.",
+                                       reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'add_inline':
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        waiting_for_input[user_id] = "add_inline"
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] 发送 <关键词> <链接>\n例如: 抽卡 https://t.me/addstickers/Pack\n/cancel 取消.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消返回", callback_data='cancel_replace')]]))
+
+    elif query.data.startswith('replace_inline_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('replace_inline_','',1); waiting_for_input[user_id] = f"replace_inline:{kw}"
+        sn = _inline_get_set(kw, gid); mode = _inline_get_mode(kw, gid); sort_on = _inline_get_sort(kw, gid)
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] *{kw}* -> {sn}\n发送关键词改名，或发送链接替换.\n/cancel 取消.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"模式: {_get_mode_label(mode)} (切换)", callback_data=f'toggle_inline_per_{kw}')],
+                [InlineKeyboardButton(f"排序: {'是' if sort_on else '否'} (切换)", callback_data=f'toggle_inline_sort_{kw}')],
+                [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+            ]))
+
+    elif query.data.startswith('toggle_inline_per_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('toggle_inline_per_','',1)
+        cur = _inline_get_mode(kw, gid); nm = _next_mode(cur)
+        _inline_set_mode(kw, nm, gid)
+        await query.answer(text=f"'{kw}' {_get_mode_label(nm)}")
+        sn = _inline_get_set(kw, gid); sort_on = _inline_get_sort(kw, gid)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"模式: {_get_mode_label(nm)} (切换)", callback_data=f'toggle_inline_per_{kw}')],
+            [InlineKeyboardButton(f"排序: {'是' if sort_on else '否'} (切换)", callback_data=f'toggle_inline_sort_{kw}')],
+            [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+        ]))
+
+    elif query.data.startswith('toggle_inline_sort_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('toggle_inline_sort_','',1)
+        cur = _inline_get_sort(kw, gid); nm = not cur
+        _inline_set_sort(kw, nm, gid)
+        await query.answer(text=f"'{kw}' 排序: {'是' if nm else '否'}")
+        mode = _inline_get_mode(kw, gid); sort_on = _inline_get_sort(kw, gid)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"模式: {_get_mode_label(mode)} (切换)", callback_data=f'toggle_inline_per_{kw}')],
+            [InlineKeyboardButton(f"排序: {'是' if sort_on else '否'} (切换)", callback_data=f'toggle_inline_sort_{kw}')],
+            [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+        ]))
+
+    elif query.data.startswith('delete_inline_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('delete_inline_','',1)
+        sk = _get_ik(gid); gid_str = str(gid)
+        old = _inline_get_set(kw, gid)
+        config.setdefault('inline_sticker_keywords',{}).setdefault(gid_str,{}).pop(kw, None); save_config(config)
+        # Clean up cache if no other group uses this set
+        all_ik_sets = set()
+        for gid2, kws in config.get('inline_sticker_keywords',{}).items():
+            for v in kws.values(): all_ik_sets.add(v.get('set','') if isinstance(v,dict) else v)
+        if old and old not in all_ik_sets:
+            inline_cache.pop(old,None); inline_queue.pop(old,None); inline_hand.pop(old,None); inline_discard.pop(old,None)
+        waiting_for_input.pop(user_id, None)
+        await query.answer(text=f"已删除 '{kw}'", show_alert=True)
+        sk = _get_ik(gid); gname = _get_group_name(gid)
+        if not sk:
+            await query.edit_message_text(
+                f"[{gname}] 没有内联关键词了.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加内联关键词", callback_data='add_inline'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        else:
+            kb = _build_list_keyboard(inline=True, group_id=gid)
+            kb.insert(-1, [InlineKeyboardButton("添加内联关键词", callback_data='add_inline')])
+            await query.edit_message_text(f"[{gname}] 内联模式关键词:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'list_sticker':
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        gname = _get_group_name(gid)
+        kb = _build_list_keyboard(group_id=gid)
+        kb.append([InlineKeyboardButton("添加贴纸关键词", callback_data='add_sticker')])
+        await query.edit_message_text(f"[{gname}] 贴纸关键词:\n点击替换.",
+                                       reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data.startswith('replace_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('replace_','',1); waiting_for_input[user_id] = f"replace:{kw}"
+        mode = _get_mode(kw, gid)
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] *{kw}* -> {_get_set(kw, gid)}\n发送关键词改名，或发送链接替换.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"模式: {_get_mode_label(mode)} (切换)", callback_data=f'toggle_per_{kw}')],
+                [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+            ]))
+
+    elif query.data.startswith('toggle_per_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('toggle_per_','',1)
+        cur = _get_mode(kw, gid); nm = _next_mode(cur)
+        _set_mode(kw, nm, gid)
+        await query.answer(text=f"'{kw}' {_get_mode_label(nm)}")
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"模式: {_get_mode_label(nm)} (切换)", callback_data=f'toggle_per_{kw}')],
+            [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+        ]))
+
+    elif query.data.startswith('delete_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('delete_','',1)
+        gid_str = str(gid)
+        sk = config.get('sticker_keywords',{}).get(gid_str,{})
+        old = _get_set(kw, gid)
+        sk.pop(kw, None)
+        config.setdefault('sticker_keywords',{})[gid_str] = sk; save_config(config)
+        # Clean cache
+        all_sk_sets = set()
+        for gid2, kws in config.get('sticker_keywords',{}).items():
+            for v in kws.values(): all_sk_sets.add(v.get('set','') if isinstance(v,dict) else v)
+        if old and old not in all_sk_sets:
+            sticker_cache.pop(old,None); sticker_queue.pop(old,None)
+        await query.answer(text=f"已删除 '{kw}'", show_alert=True)
+        sk = _get_sk(gid); gname = _get_group_name(gid)
+        if not sk:
+            await query.edit_message_text(f"[{gname}] 没有关键词了.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        else:
+            await query.edit_message_text(f"[{gname}] 贴纸关键词:", reply_markup=InlineKeyboardMarkup(_build_list_keyboard(group_id=gid)))
+
+    elif query.data == 'cancel_replace':
+        mode = waiting_for_input.pop(user_id, None); pending_copy.pop(user_id, None)
+        await query.answer(text="已取消")
+        is_inline = mode and ('inline' in str(mode))
+        is_emoji = mode and ('emoji' in str(mode))
+        is_image = mode and ('image' in str(mode))
+        gname = _get_group_name(gid)
+        if is_image:
+            ik = _get_img_kw(gid)
+            if not ik:
+                await query.edit_message_text(f"[{gname}] 没有图片关键词了.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("添加图片关键词", callback_data='add_image'), InlineKeyboardButton("返回", callback_data='back_to_start')]]))
+            else:
+                kb = _build_list_keyboard(image=True, group_id=gid)
+                kb.insert(-1, [InlineKeyboardButton("添加图片关键词", callback_data='add_image')])
+                await query.edit_message_text(f"[{gname}] 图片关键词:", reply_markup=InlineKeyboardMarkup(kb))
+        elif is_emoji:
+            ek = _get_ek(gid)
+            if not ek:
+                await query.edit_message_text(f"[{gname}] 没有 Emoji 关键词了.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji'), InlineKeyboardButton("返回", callback_data='back_to_start')]]))
+            else:
+                kb = _build_list_keyboard(emoji=True, group_id=gid)
+                kb.insert(-1, [InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji')])
+                await query.edit_message_text(f"[{gname}] Emoji 关键词:", reply_markup=InlineKeyboardMarkup(kb))
+        elif is_inline:
+            sk = _get_ik(gid)
+            if not sk:
+                await query.edit_message_text(f"[{gname}] 没有内联关键词了.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("添加内联关键词", callback_data='add_inline'), InlineKeyboardButton("返回", callback_data='back_to_start')]]))
+            else:
+                kb = _build_list_keyboard(inline=True, group_id=gid)
+                kb.insert(-1, [InlineKeyboardButton("添加内联关键词", callback_data='add_inline')])
+                await query.edit_message_text(f"[{gname}] 内联模式关键词:", reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await query.edit_message_text(f"[{gname}] 贴纸关键词:", reply_markup=InlineKeyboardMarkup(_build_list_keyboard(group_id=gid)))
+
+    elif query.data.startswith('copykw_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('copykw_', '', 1)
+        common = user_common_groups.get(user_id, {})
+        # Exclude current group
+        targets = {tgid: tname for tgid, tname in common.items() if tgid != gid and tgid != '_global'}
+        if not targets:
+            return await query.answer(text="没有其他可用的群组", show_alert=True)
+        pending_copy[user_id] = {'kw': kw, 'is_inline': False, 'source_gid': gid}
+        await query.edit_message_text(
+            f"将关键词 '{kw}' 添加到哪个群组?",
+            reply_markup=_build_copy_target_keyboard(user_id, targets)
+        )
+
+    elif query.data.startswith('copyinline_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('copyinline_', '', 1)
+        common = user_common_groups.get(user_id, {})
+        targets = {tgid: tname for tgid, tname in common.items() if tgid != gid and tgid != '_global'}
+        if not targets:
+            return await query.answer(text="没有其他可用的群组", show_alert=True)
+        pending_copy[user_id] = {'kw': kw, 'is_inline': True, 'source_gid': gid}
+        await query.edit_message_text(
+            f"将内联关键词 '{kw}' 添加到哪个群组?",
+            reply_markup=_build_copy_target_keyboard(user_id, targets, is_inline=True)
+        )
+
+    elif query.data.startswith('docopy_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        target_gid = query.data.replace('docopy_', '', 1)
+        pc = pending_copy.pop(user_id, None)
+        if not pc: return await query.answer(text="操作已过期", show_alert=True)
+        kw = pc['kw']; source_gid = pc['source_gid']
+        src_sk = _get_sk(source_gid); src_data = src_sk.get(kw, {})
+        if not src_data: return await query.answer(text="关键词已不存在", show_alert=True)
+        sn = src_data['set'] if isinstance(src_data, dict) else src_data
+        mode_val = _get_mode(kw, source_gid)
+        # Copy to target group
+        config.setdefault('sticker_keywords', {}).setdefault(target_gid, {})[kw] = {"set": sn, "mode": mode_val}
+        save_config(config)
+        # Preload if not in cache
+        if sn not in sticker_cache:
+            try:
+                ss = await context.bot.get_sticker_set(name=sn)
+                sticker_cache[sn] = [s.file_id for s in ss.stickers]
+                _init_queue(sn, sticker_cache, sticker_queue)
+            except Exception: pass
+        tname = _get_group_name(target_gid)
+        await query.answer(text=f"已添加到 [{tname}]", show_alert=True)
+        # Return to the list view
+        sk = _get_sk(gid); gname = _get_group_name(gid)
+        await query.edit_message_text(f"[{gname}] 贴纸关键词:", reply_markup=InlineKeyboardMarkup(_build_list_keyboard(group_id=gid)))
+
+    elif query.data.startswith('docopyi_'):
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        target_gid = query.data.replace('docopyi_', '', 1)
+        pc = pending_copy.pop(user_id, None)
+        if not pc: return await query.answer(text="操作已过期", show_alert=True)
+        kw = pc['kw']; source_gid = pc['source_gid']
+        src_ik = _get_ik(source_gid); src_data = src_ik.get(kw, {})
+        if not src_data: return await query.answer(text="关键词已不存在", show_alert=True)
+        sn = src_data['set'] if isinstance(src_data, dict) else src_data
+        mode_val = _inline_get_mode(kw, source_gid)
+        config.setdefault('inline_sticker_keywords', {}).setdefault(target_gid, {})[kw] = {"set": sn, "mode": mode_val}
+        save_config(config)
+        if sn not in inline_cache:
+            try:
+                ss = await context.bot.get_sticker_set(name=sn)
+                inline_cache[sn] = [s.file_id for s in ss.stickers]
+                _init_queue(sn, inline_cache, inline_queue)
+            except Exception: pass
+        inline_hand[sn] = {}
+        _save_hand()
+        tname = _get_group_name(target_gid)
+        await query.answer(text=f"已添加到 [{tname}]", show_alert=True)
+        sk = _get_ik(gid); gname = _get_group_name(gid)
+        if not sk:
+            await query.edit_message_text(f"[{gname}] 没有内联关键词了.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("添加内联关键词", callback_data='add_inline'), InlineKeyboardButton("返回", callback_data='back_to_start')]]))
+        else:
+            kb = _build_list_keyboard(inline=True, group_id=gid)
+            kb.insert(-1, [InlineKeyboardButton("添加内联关键词", callback_data='add_inline')])
+            await query.edit_message_text(f"[{gname}] 内联模式关键词:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'list_emoji':
+        # Group chat: manage current group; private chat: use selected group
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        ek = _get_ek(gid); gname = _get_group_name(gid)
+        if not ek:
+            return await query.edit_message_text(
+                f"[{gname}] 还没有 Emoji 关键词.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        kb = _build_list_keyboard(emoji=True, group_id=gid)
+        kb.insert(-1, [InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji')])
+        await query.edit_message_text(f"[{gname}] Emoji 关键词:\n点击替换.",
+                                       reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'add_emoji':
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        waiting_for_input[user_id] = f"add_emoji:"
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] 发送 <关键词> <emoji包链接>\n例如: 抽牌 https://t.me/addemoji/MyPack\n/cancel 取消.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消返回", callback_data='cancel_replace')]]))
+
+    elif query.data.startswith('replace_emoji_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('replace_emoji_', '', 1)
+        waiting_for_input[user_id] = f"replace_emoji:{kw}"
+        sn = _emoji_get_set(kw, gid); mode = _emoji_get_mode(kw, gid)
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] *{kw}* -> {sn}\n发送新emoji包链接替换.\n/cancel 取消.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"模式: {_get_mode_label(mode)} (切换)", callback_data=f'toggle_emoji_per_{kw}')],
+                [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+            ]))
+
+    elif query.data.startswith('toggle_emoji_per_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('toggle_emoji_per_', '', 1)
+        cur = _emoji_get_mode(kw, gid); nm = _next_mode(cur)
+        _emoji_set_mode(kw, nm, gid)
+        await query.answer(text=f"'{kw}' {_get_mode_label(nm)}")
+        sn = _emoji_get_set(kw, gid)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"模式: {_get_mode_label(nm)} (切换)", callback_data=f'toggle_emoji_per_{kw}')],
+            [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+        ]))
+
+    elif query.data.startswith('delete_emoji_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('delete_emoji_', '', 1)
+        old = _emoji_get_set(kw, gid)
+        config.setdefault('emoji_keywords', {}).setdefault(str(gid), {}).pop(kw, None)
+        save_config(config)
+        # Clean up cache if no other group uses this pack
+        all_emo_sets = set()
+        for gid2, kws in config.get('emoji_keywords', {}).items():
+            for v in kws.values(): all_emo_sets.add(v.get('set', '') if isinstance(v, dict) else v)
+        if old and old not in all_emo_sets:
+            emoji_cache.pop(old, None); emoji_queue.pop(old, None); emoji_discard.pop(old, None)
+        await query.answer(text=f"已删除 '{kw}'", show_alert=True)
+        ek = _get_ek(gid); gname = _get_group_name(gid)
+        if not ek:
+            await query.edit_message_text(f"[{gname}] 没有 Emoji 关键词了.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        else:
+            kb = _build_list_keyboard(emoji=True, group_id=gid)
+            kb.insert(-1, [InlineKeyboardButton("添加 Emoji 关键词", callback_data='add_emoji')])
+            await query.edit_message_text(f"[{gname}] Emoji 关键词:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'list_image':
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        ik = _get_img_kw(gid); gname = _get_group_name(gid)
+        if not ik:
+            return await query.edit_message_text(
+                f"[{gname}] 还没有图片关键词.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加图片关键词", callback_data='add_image'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        kb = _build_list_keyboard(image=True, group_id=gid)
+        kb.insert(-1, [InlineKeyboardButton("添加图片关键词", callback_data='add_image')])
+        await query.edit_message_text(f"[{gname}] 图片关键词:\n点击替换.",
+                                       reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'add_image':
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        if query.message.chat.type in ('group', 'supergroup'):
+            # In group: link to private chat
+            bot_name = context.bot.username
+            await query.edit_message_text(
+                f"请私聊 @{bot_name} 然后发送 /addimg 来添加图片关键词。",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("前往私聊", url=f"https://t.me/{bot_name}")],
+                    [InlineKeyboardButton("返回", callback_data='back_to_start')],
+                ]))
+        else:
+            waiting_for_input[user_id] = "collect_image_kw"
+            await query.edit_message_text(
+                "发送图片关键词名称:\n/cancel 取消.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消", callback_data='cancel_replace')]]))
+
+    elif query.data.startswith('replace_image_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('replace_image_', '', 1)
+        cnt = len(_img_get_files(kw, gid)); mode = _img_get_mode(kw, gid)
+        bot_name = context.bot.username
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] *{kw}* ({cnt}张)\n私聊 @{bot_name} 发送 /addimg 重新收集.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"模式: {_get_mode_label(mode)} (切换)", callback_data=f'toggle_image_per_{kw}')],
+                [InlineKeyboardButton("返回", callback_data='back_to_start')]
+            ]))
+
+    elif query.data.startswith('toggle_image_per_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('toggle_image_per_', '', 1)
+        cur = _img_get_mode(kw, gid); nm = _next_mode(cur)
+        _img_set_mode(kw, nm, gid)
+        await query.answer(text=f"'{kw}' {_get_mode_label(nm)}")
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"模式: {_get_mode_label(nm)} (切换)", callback_data=f'toggle_image_per_{kw}')],
+            [InlineKeyboardButton("取消返回", callback_data='cancel_replace')]
+        ]))
+
+    elif query.data.startswith('delete_image_'):
+        gid = str(query.message.chat.id) if query.message.chat.type in ('group', 'supergroup') else user_selected_group.get(user_id, '_global')
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        kw = query.data.replace('delete_image_', '', 1)
+        key = _img_kw_key(gid, kw)
+        config.setdefault('image_keywords', {}).setdefault(str(gid), {}).pop(kw, None)
+        save_config(config)
+        img_cache.pop(key, None); img_queue.pop(key, None); img_discard.pop(key, None)
+        await query.answer(text=f"已删除 '{kw}'", show_alert=True)
+        ik = _get_img_kw(gid); gname = _get_group_name(gid)
+        if not ik:
+            await query.edit_message_text(f"[{gname}] 没有图片关键词了.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("添加图片关键词", callback_data='add_image'),
+                     InlineKeyboardButton("返回", callback_data='back_to_start')]
+                ]))
+        else:
+            kb = _build_list_keyboard(image=True, group_id=gid)
+            kb.insert(-1, [InlineKeyboardButton("添加图片关键词", callback_data='add_image')])
+            await query.edit_message_text(f"[{gname}] 图片关键词:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data == 'add_sticker':
+        if not adm: return await query.answer(text="仅管理员", show_alert=True)
+        waiting_for_input[user_id] = "add"
+        await query.edit_message_text(
+            f"[{_get_group_name(gid)}] 发送 <关键词> <链接>\n/cancel 取消.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("取消返回", callback_data='cancel_replace')]]))
+
+    elif query.data == 'back_to_start':
+        pending_copy.pop(user_id, None)
+        text, markup = _show_main_menu_text(user, gid)
+        await query.edit_message_text(text, reply_markup=markup)
+
+    # ========== 阵列模式 ==========
+    elif query.data == 'array_mode':
+        """主菜单进入阵列模式"""
+        await query.edit_message_text(
+            "🎮 阵列模式\n\n"
+            "9×9 Emoji 五子棋盘。\n"
+            "发送 /join 加入房间（❌ / ⭕），\n"
+            "然后发送坐标（如 a1、e5、i9）即可落子。\n"
+            "五子连珠即获胜。\n\n"
+            "坐标：字母行(a-i)+数列(1-9)，如 a2=第一行第二列",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("返回主菜单", callback_data='back_to_start')],
+            ])
+        )
+
+    elif query.data == 'array_join':
+        # kept for backward compat but /join is the main way
+        await _do_array_join(update, update.effective_user.id, update.effective_chat.id)
+
+    elif query.data == 'array_spectate':
+        await _array_show_board(query, None)
+
+    elif query.data == 'array_reset':
+        global array_board
+        array_board = [['⬜'] * 9 for _ in range(9)]
+        array_players.clear()
+        await query.answer(text="棋盘已重置，玩家已清空", show_alert=True)
+        await _array_show_board(query, update.effective_user.id)
+
+    elif query.data == 'array_leave':
+        uid = update.effective_user.id
+        array_players.pop(uid, None)
+        await query.answer(text="已离开房间", show_alert=True)
+        await _array_show_board(query, update.effective_user.id)
+
+
+
+def _array_get_thread(update):
+    """获取话题 ID（论坛群组需要，普通群返回 None）"""
+    msg = update.message if hasattr(update, 'message') and update.message else None
+    if msg:
+        return getattr(msg, 'message_thread_id', None)
+    q = getattr(update, 'callback_query', None)
+    if q and q.message:
+        return getattr(q.message, 'message_thread_id', None)
+    return None
+
+# ========== 阵列模式 — 发送坐标指令 ==========
+async def handle_array_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+
+    # 仅处理 a1-i9（字母=行，数字=列）
+    if not re.fullmatch(r'[a-iA-I][1-9]', text):
+        return  # 不处理，留给 handle_keyword
+
+    # 检查该群是否有棋盘消息（如被删则自动重建）
+    thread_id = _array_get_thread(update)
+    if chat_id not in array_board_msg:
+        if uid not in array_players:
+            await update.message.reply_text("当前没有激活的棋盘，发送 /join 加入房间。")
+            return
+        board_str = _array_board_to_text()
+        status = _array_status_text(update.effective_user)
+        msg = await context.bot.send_message(chat_id=chat_id, text=f"{board_str}\n\n{status}", message_thread_id=thread_id)
+        array_board_msg[chat_id] = (msg.message_id, thread_id)
+
+    # 检查是否在房间中
+    if uid not in array_players:
+        await update.message.reply_text("你不在房间中。请发送 /join 加入房间。")
+        return
+
+    # 解析坐标（字母=行号，数字=列号，a2=第一行第二列）
+    pos = text.lower()
+    row = ord(pos[0]) - ord('a')
+    col = int(pos[1]) - 1
+
+    if array_board[row][col] != '⬜':
+        await update.message.reply_text("这个位置已经有棋子了。")
+        return
+
+    # 落子
+    my_sym = '❌' if array_players[uid] == 'X' else '⭕'
+    array_board[row][col] = my_sym
+
+    # 检查胜负
+    winner = _array_check_winner()
+    board_str = _array_board_to_text()
+    status = _array_status_text(update.effective_user)
+    msg_id, t_id = array_board_msg.get(chat_id, (None, None))
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=f"{board_str}\n\n{status}",
+        )
+    except Exception:
+        msg = await context.bot.send_message(chat_id=chat_id, text=f"{board_str}\n\n{status}", message_thread_id=t_id)
+        array_board_msg[chat_id] = (msg.message_id, t_id)
+
+    # 胜负判定
+    if winner:
+        await update.message.reply_text(f"🎉 {my_sym} 获胜！")
+        return
+
+    # 删除用户输入的坐标消息（保持聊天整洁）
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+
+async def _do_array_join(update, uid, chat_id):
+    """执行加入房间操作 — 首次 join 时自动激活棋盘"""
+    target = update.message if hasattr(update, 'message') and update.message else update.effective_message
+    if not target:
+        target = update.effective_chat  # fallback
+
+    if uid not in array_players:
+        x_count = sum(1 for p in array_players.values() if p == 'X')
+        o_count = sum(1 for p in array_players.values() if p == 'O')
+        assigned = 'X' if x_count <= o_count else 'O'
+        array_players[uid] = assigned
+        symbol = '❌' if assigned == 'X' else '⭕'
+        await target.reply_text(f"加入成功！你的阵营是 {symbol}")
+    else:
+        symbol = '❌' if array_players[uid] == 'X' else '⭕'
+        await target.reply_text(f"你已在房间中，阵营：{symbol}")
+
+    # 如无棋盘消息则自动创建
+    thread_id = _array_get_thread(update)
+    if chat_id not in array_board_msg:
+        board_str = _array_board_to_text()
+        status = _array_status_text(uid)
+        bot = target.get_bot() if hasattr(target, 'get_bot') else target.bot
+        # 删旧棋盘
+        if chat_id in array_board_msg:
+            msg_id, _ = array_board_msg[chat_id]
+            try: await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except Exception: pass
+        msg = await bot.send_message(chat_id=chat_id, text=f"{board_str}\n\n{status}", message_thread_id=thread_id)
+        array_board_msg[chat_id] = (msg.message_id, thread_id)
+    else:
+        await _array_show_board(target, uid)
+
+
+
+async def cmd_array_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """指令 /join 加入阵列房间"""
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await _do_array_join(update, uid, chat_id)
+
+
+async def cmd_array_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """指令 /game 显示棋盘（删旧显示新）"""
+    chat_id = update.effective_chat.id
+    thread_id = _array_get_thread(update)
+    # 删旧棋盘
+    if chat_id in array_board_msg:
+        msg_id, _ = array_board_msg[chat_id]
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception: pass
+    board_str = _array_board_to_text()
+    status = _array_status_text(update.effective_user)
+    msg = await context.bot.send_message(chat_id=chat_id, text=f"{board_str}\n\n{status}", message_thread_id=thread_id)
+    array_board_msg[chat_id] = (msg.message_id, thread_id)
+
+
+async def cmd_array_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """指令 /stop 结束游戏"""
+    global array_board
+    chat_id = update.effective_chat.id
+    if chat_id in array_board_msg:
+        msg_id, _ = array_board_msg[chat_id]
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+        del array_board_msg[chat_id]
+    array_board = [['⬜'] * 9 for _ in range(9)]
+    array_players.clear()
+    await update.message.reply_text("游戏已结束，棋盘已清除。")
+
+
+async def _array_show_board(target, uid):
+    """更新棋盘消息（编辑已有的，或新建）"""
+    board_str = _array_board_to_text()
+    status = _array_status_text(uid)
+    text = f"{board_str}\n\n{status}"
+
+    # 获取 chat_id
+    if hasattr(target, 'message') and target.message:
+        chat_id = target.message.chat.id
+    elif hasattr(target, 'chat') and target.chat:
+        chat_id = target.chat.id
+    else:
+        return
+
+    thread_id = None
+    if hasattr(target, 'message') and target.message:
+        thread_id = getattr(target.message, 'message_thread_id', None)
+
+    # 优先编辑现有棋盘消息
+    if chat_id in array_board_msg:
+        msg_id, _ = array_board_msg[chat_id]
+        try:
+            await target.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+            return
+        except Exception:
+            pass
+
+    # 发新棋盘
+    _array_del_old(chat_id, target.bot)
+    msg = await target.bot.send_message(chat_id=chat_id, text=text, message_thread_id=thread_id)
+    array_board_msg[chat_id] = (msg.message_id, thread_id)
+
+
+def _array_board_to_text():
+    lines = [' 1\uFE0F\u20E3 2\uFE0F\u20E3 3\uFE0F\u20E3 4\uFE0F\u20E3 5\uFE0F\u20E3 6\uFE0F\u20E3 7\uFE0F\u20E3 8\uFE0F\u20E3 9\uFE0F\u20E3']
+    row_labels = 'ABCDEFGHI'
+    for r in range(9):
+        lines.append(row_labels[r] + ''.join(array_board[r]))
+    return '\n'.join(lines)
+
+
+def _array_status_text(uid):
+    if not array_players:
+        return "房间空，点击「加入房间」开始！点击「旁观模式」查看棋盘。"
+    parts = []
+    for pid, sym in array_players.items():
+        label = '❌' if sym == 'X' else '⭕'
+        parts.append(f"{label}")
+    status = "  |  ".join(parts)
+    if uid is not None and uid in array_players:
+        my_sym = '❌' if array_players[uid] == 'X' else '⭕'
+        return f"你的阵营：{my_sym}\n{status}"
+    return f"旁观中\n{status}"
+
+
+def _array_check_winner():
+    """五子棋胜负判定：任意方向连续 5 子即获胜"""
+    directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+    for sym in ('X', 'O'):
+        emoji = '❌' if sym == 'X' else '⭕'
+        for r in range(9):
+            for c in range(9):
+                if array_board[r][c] != emoji:
+                    continue
+                for dr, dc in directions:
+                    count = 1
+                    rr, cc = r + dr, c + dc
+                    while 0 <= rr < 9 and 0 <= cc < 9 and array_board[rr][cc] == emoji:
+                        count += 1
+                        rr += dr; cc += dc
+                    if count >= 5:
+                        return sym
+    return None
+
+
+
+async def error_handler(update, context):
+    import traceback; logger.error(f"Error: {context.error}\n{traceback.format_exc()}")
+
+
+def main():
+    global config
+    token = os.getenv('BOT_TOKEN', config.get('bot_token', ''))
+    if not token or token == 'YOUR_BOT_TOKEN_HERE': return print("请在 .env 文件中设置 BOT_TOKEN")
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("yu", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("liststicker", show_sticker_keywords))
+    app.add_handler(CommandHandler("addsticker", add_sticker_keyword))
+    app.add_handler(CommandHandler("emo", cmd_addemoji))
+    app.add_handler(CommandHandler("delyu", cmd_delyu))
+    app.add_handler(CommandHandler("counter", cmd_counter))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("join", cmd_array_join))
+    app.add_handler(CommandHandler("game", cmd_array_game))
+    app.add_handler(CommandHandler("stop", cmd_array_stop))
+    app.add_handler(CommandHandler("addimg", cmd_addimg))
+    app.add_handler(ChatMemberHandler(my_chat_member_handler))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(InlineQueryHandler(inline_query))
+    app.add_handler(ChosenInlineResultHandler(chosen_inline))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^[df]$'), handle_return_card))
+    app.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_sent))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Regex(r'^[a-iA-I][1-9]$') & filters.TEXT & ~filters.COMMAND, handle_array_move))
+    app.add_handler(MessageHandler(filters.TEXT, handle_keyword))
+    app.add_error_handler(error_handler)
+
+    # Set bot commands menu
+    async def set_cmds(app):
+        commands = [
+            BotCommand("yu", "打开管理菜单"),
+            BotCommand("help", "查看全部指令说明"),
+            BotCommand("addsticker", "添加贴纸关键词"),
+            BotCommand("emo", "添加 Emoji 关键词"),
+            BotCommand("addimg", "添加图片关键词"),
+            BotCommand("delyu", "删除关键词(全类型)"),
+            BotCommand("counter", "开关计数器"),
+            BotCommand("cancel", "取消当前操作"),
+            BotCommand("join", "加入阵列房间"),
+            BotCommand("game", "显示阵列棋盘"),
+            BotCommand("stop", "结束阵列游戏"),
+        ]
+        await app.bot.set_my_commands(commands)
+        logger.info("Commands set")
+
+    app.post_init = set_cmds
+
+    import asyncio
+    async def preload(): await preload_sticker_sets(app=app)
+    try: asyncio.get_event_loop().run_until_complete(preload())
+    except Exception as e: logger.warning(f"Preload: {e}")
+    logger.info("Bot starting..."); print("[OK] Bot 已启动! Ctrl+C 停止")
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        import traceback
+        logger.critical(f"Bot polling crashed: {e}\n{traceback.format_exc()}")
+        raise
+
+if __name__ == '__main__': main()

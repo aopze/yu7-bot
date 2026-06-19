@@ -1,0 +1,11 @@
+[build]
+  builder = "nixpacks"
+  buildCommand = "pip install -r requirements.txt"
+
+[deploy]
+  startCommand = "python bot.py"
+  healthcheckPath = "/"
+  restartPolicyType = "always"
+
+[service]
+  name = "yu7-bot"

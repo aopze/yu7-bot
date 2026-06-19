@@ -1,0 +1,28 @@
+app = "yu7-bot"
+primary_region = "hkg"
+
+[build]
+
+[env]
+  TZ = "Asia/Shanghai"
+  PYTHONUNBUFFERED = "1"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+    [services.ports.http_checks]
+      interval = "30s"
+      timeout = "5s"
+      grace_period = "5s"
+      method = "get"
+      path = "/"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
