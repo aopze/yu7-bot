@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # bot_handlers.py - 消息/命令处理器 (keyword, sticker, emoji, image, inline, counter, return-card)
-import json, logging, os, random, re, asyncio
+import html, json, logging, os, random, re, asyncio, subprocess, tempfile, shutil
 from io import BytesIO
 from PIL import Image
 from bot_config import (
@@ -17,14 +17,16 @@ from bot_config import (
     _inline_get_set, _inline_get_mode, _inline_set_mode,
     _emoji_get_set, _emoji_get_mode, _emoji_set_mode,
     _inline_get_sort, _inline_set_sort,
-    _get_img_kw, _img_kw_key, _img_get_files, _img_get_mode, _img_set_mode,
+    _get_img_kw, _img_kw_key, _img_get_files, _img_get_mode, _img_set_mode, _img_set_stitch,
     _get_comp_kw, _comp_get_groups, _comp_get_mode, _comp_set_mode,
     _img_get_stitch,
     _get_keyword_extras, _add_keyword_extra, _get_extra_pack_name, _set_extra_pack_name,
+    _get_extra_pack_video_name, _set_extra_pack_video_name,
     _is_limited_set, _get_group_name, _resolve_group, _refresh_common_groups,
-    _filter_blocked_stickers,
+    _filter_blocked_stickers, _pack_emoji, _norm_emoji,
     _inline_is_shared, _inline_set_shared, _get_inline_queue, _get_inline_discard,
     _set_inline_queue, _init_shared_pool, _save_shared_state,
+    _build_kw_edit_markup,
     _init_queue, _all_sticker_sets,
     _save_json, _save_hand, _save_inline_state, _save_img_state, _load_json,
     _save_kept, _load_kept,
@@ -34,7 +36,7 @@ from bot_config import (
     CONFIG_FILE, QUEUE_FILE, INLINE_QUEUE_FILE, DISCARD_FILE, HAND_FILE, KEPT_FILE, IMG_KEPT_FILE,
     EMOJI_QUEUE_FILE, EMOJI_DISCARD_FILE, SHARED_QUEUE_FILE, SHARED_DISCARD_FILE, STICKER_DISCARD_FILE,
     IMG_QUEUE_FILE, IMG_DISCARD_FILE,
-    _show_main_menu_text,
+    _show_main_menu_text, _build_keyword_manage_menu,
     logger,
 )
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultCachedSticker, MessageEntity, InputSticker
@@ -78,15 +80,73 @@ def _stitch_images_v(images_data: list) -> BytesIO:
     return output
 
 async def start(update, context):
+    """Handle /start — show main admin menu."""
+    # 方舟战棋深链回传（/start score:层_杀）交给 bot_rank 处理，不展示管理菜单
+    if context.args and (context.args[0].startswith("score:") or context.args[0].startswith("name:")):
+        from bot_rank import handle_start_param
+        await handle_start_param(update, context, context.args[0])
+        return
+    user = update.effective_user; user_id = user.id
+    group_id = _resolve_group(update, user_id)
+    chat = update.effective_chat
+    if chat and chat.type == 'private' and user_id not in user_common_groups:
+        await _refresh_common_groups(context.bot, user_id)
+    text, markup = _show_main_menu_text(user, group_id)
+    await update.message.reply_text(text, reply_markup=markup)
+
+async def cmd_yu(update, context):
+    """Handle /yu — quick jump to keyword edit or show main menu."""
     user = update.effective_user; user_id = user.id
     group_id = _resolve_group(update, user_id)
 
-    # On first /yu in private chat, check common groups once
     chat = update.effective_chat
     if chat and chat.type == 'private' and user_id not in user_common_groups:
         await _refresh_common_groups(context.bot, user_id)
 
-    text, markup = _show_main_menu_text(user, group_id)
+    # Quick jump: /yu 关键词 → show keyword edit page
+    if update.message and update.message.text:
+        parts = update.message.text.strip().split(None, 1)
+        if len(parts) >= 2:
+            kw = parts[1].strip()
+            gid_str = str(group_id)
+            ik = config.get('inline_sticker_keywords', {}).get(gid_str, {})
+            sk = config.get('sticker_keywords', {}).get(gid_str, {})
+            ek = config.get('emoji_keywords', {}).get(gid_str, {})
+            img_kws = config.get('image_keywords', {}).get(gid_str, {})
+            comp_kws = config.get('composite_keywords', {}).get(gid_str, {})
+
+            if kw in ik:
+                sn = ik[kw].get('set', '') if isinstance(ik[kw], dict) else ik[kw]
+                waiting_for_input[user_id] = f"replace_inline:{kw}"
+                await update.message.reply_text(
+                    f"[{html.escape(_get_group_name(group_id))}] <b>{html.escape(kw)}</b> -> {html.escape(sn)}\n发送关键词改名，或发送链接替换.\n/cancel 取消.",
+                    reply_markup=_build_kw_edit_markup(kw, 'inline', group_id), parse_mode='HTML'); return
+            elif kw in sk:
+                waiting_for_input[user_id] = f"replace:{kw}"
+                await update.message.reply_text(
+                    f"[{html.escape(_get_group_name(group_id))}] <b>{html.escape(kw)}</b> -> {html.escape(_get_set(kw, group_id))}\n发送关键词改名，或发送链接替换.",
+                    reply_markup=_build_kw_edit_markup(kw, 'sticker', group_id), parse_mode='HTML'); return
+            elif kw in ek:
+                sn = ek[kw].get('set', '') if isinstance(ek[kw], dict) else ek[kw]
+                waiting_for_input[user_id] = f"replace_emoji:{kw}"
+                await update.message.reply_text(
+                    f"[{html.escape(_get_group_name(group_id))}] <b>{html.escape(kw)}</b> -> {html.escape(sn)}\n发送关键词改名，或发送链接替换.\n/cancel 取消.",
+                    reply_markup=_build_kw_edit_markup(kw, 'emoji', group_id), parse_mode='HTML'); return
+            elif kw in img_kws:
+                waiting_for_input[user_id] = f"replace_image:{kw}"
+                await update.message.reply_text(
+                    f"[{html.escape(_get_group_name(group_id))}] <b>{html.escape(kw)}</b> ({len(_img_get_files(kw, group_id))}张)\n发送关键词改名，/cancel 取消.",
+                    reply_markup=_build_kw_edit_markup(kw, 'image', group_id), parse_mode='HTML'); return
+            elif kw in comp_kws:
+                waiting_for_input[user_id] = f"replace_composite:{kw}"
+                groups = _comp_get_groups(kw, group_id); total = sum(len(g) for g in groups)
+                await update.message.reply_text(
+                    f"[{html.escape(_get_group_name(group_id))}] <b>{html.escape(kw)}</b> ({total}张/{len(groups)}组)\n发送关键词改名，/cancel 取消.",
+                    reply_markup=_build_kw_edit_markup(kw, 'composite', group_id), parse_mode='HTML'); return
+            else:
+                await update.message.reply_text(f"未找到关键词 '{kw}'"); return
+
+    text, markup = _build_keyword_manage_menu(group_id)
     await update.message.reply_text(text, reply_markup=markup)
 
 
@@ -178,23 +238,67 @@ async def cmd_keep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📌 {label}")
 
 
+_HELP_PLAIN = (
+    "关键词使用方式:\n"
+    "关键词 N: 抽取N张卡牌\n"
+    "关键词 N-: 从弃牌堆回收N张入牌库(内联/Emoji)\n"
+    "关键词 0: 全部弃牌洗入牌库\n"
+    "关键词 0d: 牌库完全重置为初始状态\n"
+    "/refresh 关键词: 从贴纸包/Emoji包同步最新内容\n"
+    "关键词 Nd: 明牌抽取N张卡牌\n"
+    "关键词 Nw: 展示牌堆顶N张卡牌\n"
+    "关键词 Nf / N! / N！: 弃置牌堆顶N张卡牌入弃牌区\n"
+    "d / dN: 回复贴纸 d 加1张手牌，dN 加N张相同的牌（在关键词里入对应包，否则入手牌）；回复图片 d 回收至牌库\n"
+    "d N%: 回复贴纸/图片/视频/GIF，按百分比缩放后入库（如 d 72%、d 112%）\n"
+    "回复图片/视频/GIF + d: 先转成贴纸再加入手牌\n"
+    "f: 回复图片 f 弃置（跳过后再抽）\n"
+    "数字-数字-数字: 连续打出多张卡牌\n"
+    "数字-数字-数字/: 连续明牌打出多张卡牌\n"
+    "数字~数字: 打出序号连贯的卡牌"
+)
+
+_HELP_RICH = """## 🎴 卡牌机器人 · 用法速查
+
+### 抽牌
+- `关键词 N` — 抽取 N 张卡牌
+- `关键词 Nd` — 明牌抽取 N 张卡牌
+- `关键词 Nw` — 展示牌堆顶 N 张卡牌
+
+### 回收 / 弃置
+- `关键词 N-` — 从弃牌堆回收 N 张入牌库（内联 / Emoji）
+- `关键词 0` — 全部弃牌洗入牌库
+- `关键词 0d` — 牌库完全重置为初始状态
+- `关键词 Nf` / `N!` / `N！` — 弃置牌堆顶 N 张卡牌入弃牌区
+
+### 出牌
+- `数字-数字-数字` — 连续打出多张卡牌
+- `数字-数字-数字/` — 连续明牌打出多张卡牌
+- `数字~数字` — 打出序号连贯的卡牌
+
+### 回复用法
+- 回复贴纸 + `d` / `dN` — 加 1 / N 张到手牌（在关键词里则入对应包）
+- 回复图片 + `d` — 回收这张图至牌库
+- 回复图片 + `f` — 弃置这张图（跳过后再抽）
+- 回复图片 / 视频 / GIF + `d` — 先做成贴纸再加入手牌
+- 回复贴纸 / 图片 / 视频 / GIF + `d N%` — 按百分比缩放后入库（如 `d 72%`、`d 112%`）
+
+### 管理
+- `/refresh 关键词` — 从贴纸包 / Emoji 包同步最新内容
+- `/keep`（回复内联贴纸） — 查看保留区
+
+> 百分比 ≤100% 用透明背景补齐，>100% 从中心裁剪。动态 tgs 贴纸不支持缩放。"""
+
+
 async def help_command(update, context):
-    await update.message.reply_text(
-        "关键词使用方式:\n"
-        "关键词 N: 抽取N张卡牌\n"
-        "关键词 N-: 从弃牌堆回收N张入牌库(内联/Emoji)\n"
-        "关键词 0: 全部弃牌洗入牌库\n"
-        "关键词 0d: 牌库完全重置为初始状态\n"
-        "/refresh 关键词: 从贴纸包/Emoji包同步最新内容\n"
-        "关键词 Nd: 明牌抽取N张卡牌\n"
-        "关键词 Nw: 展示牌堆顶N张卡牌\n"
-        "关键词 Nf / N! / N！: 弃置牌堆顶N张卡牌入弃牌区\n"
-        "d: 回复贴纸 d 回收至手牌；回复图片 d 回收至牌库\n"
-        "f: 回复图片 f 弃置（跳过后再抽）\n"
-        "数字-数字-数字: 连续打出多张卡牌\n"
-        "数字-数字-数字/: 连续明牌打出多张卡牌\n"
-        "数字~数字: 打出序号连贯的卡牌"
-    )
+    """/help：优先 Rich Message（标题+列表+引用），失败自动降级普通文本。"""
+    try:
+        from bot_rich import send_rich
+        if await send_rich(context.bot, update.effective_chat.id, _HELP_RICH,
+                           thread_id=getattr(update.effective_message, 'message_thread_id', None)):
+            return
+    except Exception as e:
+        logger.warning(f"rich help failed: {e}")
+    await update.message.reply_text(_HELP_PLAIN)
 
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -269,26 +373,98 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not found:
         await update.message.reply_text(f"未找到关键词「{kw}」")
 async def show_sticker_keywords(update, context):
+    """/liststicker：优先 Rich Message 表格，失败降级纯文本列表。"""
     user_id = update.effective_user.id
     group_id = _resolve_group(update, user_id)
     sk = _get_sk(group_id)
     if not sk: return await update.message.reply_text('无关键词')
-    await update.message.reply_text("\n".join(f"  {k} -> {_get_set(k, group_id)}" for k in sk))
+    plain = "\n".join(f"  {k} -> {_get_set(k, group_id)}" for k in sk)
+    try:
+        from bot_rich import send_rich, md_table
+        gname = _get_group_name(group_id)
+        rows = [[f"`{k}`", f"`{_get_set(k, group_id)}`"] for k in sk]
+        markdown = f"## 📚 关键词列表 · {gname}\n\n" + md_table(['关键词', '贴纸包'], rows)
+        if await send_rich(context.bot, update.effective_chat.id, markdown,
+                           thread_id=getattr(update.effective_message, 'message_thread_id', None)):
+            return
+    except Exception as e:
+        logger.warning(f"rich liststicker failed: {e}")
+    await update.message.reply_text(plain)
 
 async def add_sticker_keyword(update, context):
     user_id = update.effective_user.id
     if user_id not in config.get('admin_ids',[]): return await update.message.reply_text('仅管理员')
-    if len(context.args) < 2: return await update.message.reply_text('/addsticker <关键词> <包名>')
+    if len(context.args) < 2: return await update.message.reply_text('/addsticker <关键词> <包名> [emoji]')
     kw, sn = context.args[0], context.args[1]
+    emoji_filter = _norm_emoji(context.args[2]) if len(context.args) >= 3 else None
     group_id = user_selected_group.get(user_id, '_global')
     gid = str(group_id)
     try:
-        ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]
-        sticker_cache[sn] = stickers; _init_queue(sn, sticker_cache, sticker_queue)
-        config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "sequential"}
+        ss = await context.bot.get_sticker_set(name=sn)
+        allowed = _filter_blocked_stickers(sn, ss.stickers)
+        if emoji_filter:
+            from bot_config import _filtered_sn, _pack_emoji
+            cache_sn = _filtered_sn(sn, emoji_filter)
+            em = _pack_emoji.get(sn, {})
+            filtered = [fid for fid in allowed if em.get(fid, '') == emoji_filter]
+            logger.info(f"EMOJI_ADDSTICKER_DEBUG: sn={sn} filter={repr(emoji_filter)} total={len(allowed)} matched={len(filtered)} emojis={list(set(em.values()))}")
+            sticker_cache[cache_sn] = filtered; _init_queue(cache_sn, sticker_cache, sticker_queue)
+            cfg = {"set": sn, "mode": "sequential", "exact": True, "emoji_filter": emoji_filter}
+        else:
+            sticker_cache[sn] = allowed; _init_queue(sn, sticker_cache, sticker_queue)
+            cfg = {"set": sn, "mode": "sequential", "exact": True}
+        config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = cfg
         save_config(config)
         gname = _get_group_name(group_id)
-        await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({len(stickers)}张)")
+        actual = len(filtered) if emoji_filter else len(allowed)
+        extra = f" (只看{emoji_filter} → {actual}/{len(allowed)}张)" if emoji_filter else ""
+        await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({actual}张){extra}")
+    except Exception as e: await update.message.reply_text(f"失败: {e}")
+
+
+async def cmd_addin(update, context):
+    """Add inline keyword from group: /addin 关键词 [emoji] 链接"""
+    user_id = update.effective_user.id
+    if user_id not in config.get("admin_ids",[]): return await update.message.reply_text("仅管理员")
+    if len(context.args) < 2: return await update.message.reply_text("/addin <关键词> [emoji] <链接>")
+    chat = update.effective_chat
+    gid = str(chat.id) if chat and chat.type in ("group","supergroup") else str(user_selected_group.get(user_id, "_global"))
+    text = " ".join(context.args)
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2: return await update.message.reply_text("/addin <关键词> [emoji] <链接>")
+    kw, rest = parts[0], parts[1]
+    emoji_filter = None
+    first_char = rest[0] if rest else ""
+    after = rest[1:].strip()
+    if first_char and ord(first_char) > 127 and after:
+        emoji_filter = _norm_emoji(first_char)
+        rest = after
+    m = re.search(r"add(?:stickers|emoji)/([a-zA-Z0-9_]+)", rest)
+    sn = m.group(1) if m else rest.strip().split("/")[-1].split("?")[0]
+    if not sn: return await update.message.reply_text("无法提取包名")
+    try:
+        ss = await context.bot.get_sticker_set(name=sn)
+        allowed = _filter_blocked_stickers(sn, ss.stickers)
+        if emoji_filter:
+            from bot_config import _filtered_sn, _pack_emoji
+            cache_sn = _filtered_sn(sn, emoji_filter)
+            em = _pack_emoji.get(sn, {})
+            filtered = [fid for fid in allowed if em.get(fid, "") == emoji_filter]
+            logger.info(f"EMOJI_ADDIN_DEBUG: sn={sn} filter={repr(emoji_filter)} total={len(allowed)} matched={len(filtered)} emojis={list(set(em.values()))}")
+            inline_cache[cache_sn] = filtered; _init_queue(cache_sn, inline_cache, inline_queue)
+            inline_hand[cache_sn] = {}; _save_hand()
+            cfg = {"set": sn, "mode": "limited", "exact": True, "sort": False, "emoji_filter": emoji_filter}
+            actual, total = len(filtered), len(allowed)
+        else:
+            inline_cache[sn] = allowed; _init_queue(sn, inline_cache, inline_queue)
+            inline_hand[sn] = {}; _save_hand()
+            cfg = {"set": sn, "mode": "limited", "exact": True, "sort": False}
+            actual, total = len(allowed), len(allowed)
+        config.setdefault("inline_sticker_keywords",{}).setdefault(gid,{})[kw] = cfg
+        save_config(config)
+        gname = _get_group_name(gid)
+        extra = f" (只看{emoji_filter} -> {actual}/{total}张)" if emoji_filter else ""
+        await update.message.reply_text(f"内联添加成功! [{gname}] {kw} -> {sn} ({actual}张){extra}")
     except Exception as e: await update.message.reply_text(f"失败: {e}")
 
 async def cancel(update, context):
@@ -345,6 +521,19 @@ async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📌 单包模式：@bot 只显示最常用内联包的手牌")
 
 
+async def cmd_restart(update, context):
+    """重启 bot: /restart (仅管理员)"""
+    uid = update.effective_user.id
+    if uid not in config.get('admin_ids', []):
+        await update.message.reply_text("仅管理员可操作")
+        return
+    await update.message.reply_text("🔄 正在重启...")
+    import os, asyncio
+    # Give the message time to send, then exit
+    await asyncio.sleep(0.5)
+    os._exit(0)
+
+
 async def cmd_gap(update, context):
     """拼接模式分隔符: /gap"""
     uid = update.effective_user.id
@@ -386,7 +575,7 @@ async def cmd_addemoji(update, context):
         emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
         if not emoji_map:
             return await update.message.reply_text(f"包 '{sn}' 中没有自定义 Emoji")
-        config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random"}
+        config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random", "exact": True}
         save_config(config)
         emoji_cache[sn] = emoji_map; _init_queue(sn, emoji_cache, emoji_queue)
         gname = _get_group_name(gid)
@@ -593,7 +782,7 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 emoji_map = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
                 if not emoji_map:
                     return await update.message.reply_text(f"包 '{sn}' 中没有自定义 Emoji")
-                config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random"}
+                config.setdefault('emoji_keywords', {}).setdefault(gid, {})[kw] = {"set": sn, "mode": "random", "exact": True}
                 save_config(config)
                 emoji_cache[sn] = emoji_map; _init_queue(sn, emoji_cache, emoji_queue)
                 gname = _get_group_name(gid)
@@ -636,18 +825,42 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif mode == "add":
-            parts = text.strip().split(maxsplit=1)
-            if len(parts) < 2: return await update.message.reply_text('格式: <关键词> <链接>')
-            kw, link = parts[0], parts[1]
-            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', link); sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+            # Parse: kw [emoji] link
+            text = text.strip()
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2: return await update.message.reply_text('格式: <关键词> [emoji] <链接>')
+            kw, rest = parts[0], parts[1]
+            emoji_filter = None
+            first_char = rest[0] if rest else ''
+            after = rest[1:].strip()
+            if first_char and ord(first_char) > 127 and after:
+                emoji_filter = _norm_emoji(first_char)
+                rest = after
+            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', rest)
+            sn = m.group(1) if m else rest.split('/')[-1].split('?')[0]
             if not sn: return await update.message.reply_text('无法提取包名')
             try:
-                ss = await context.bot.get_sticker_set(name=sn); sticks = [s.file_id for s in ss.stickers]
-                config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "sequential"}
+                ss = await context.bot.get_sticker_set(name=sn)
+                allowed = _filter_blocked_stickers(sn, ss.stickers)
+                if emoji_filter:
+                    from bot_config import _filtered_sn, _pack_emoji
+                    cache_sn = _filtered_sn(sn, emoji_filter)
+                    em = _pack_emoji.get(sn, {})
+                    filtered = [fid for fid in allowed if em.get(fid, '') == emoji_filter]
+                    logger.info(f"EMOJI_ADD_DEBUG: sn={sn} filter={repr(emoji_filter)} total={len(allowed)} matched={len(filtered)} sample_em={list(set(em.values()))[:10] if em else '[EMPTY]'}")
+                    sticker_cache[cache_sn] = filtered
+                    _init_queue(cache_sn, sticker_cache, sticker_queue)
+                    config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {
+                        "set": sn, "mode": "sequential", "exact": True, "emoji_filter": emoji_filter}
+                else:
+                    sticker_cache[sn] = allowed; _init_queue(sn, sticker_cache, sticker_queue)
+                    config.setdefault('sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "sequential", "exact": True}
                 save_config(config)
-                sticker_cache[sn] = sticks; _init_queue(sn, sticker_cache, sticker_queue)
                 gname = _get_group_name(gid)
-                await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({len(sticks)}张)")
+                actual_count = len(filtered) if emoji_filter else len(allowed)
+                total_count = len(allowed)
+                extra = f" (只看{emoji_filter} → {actual_count}/{total_count}张)" if emoji_filter else ""
+                await update.message.reply_text(f"添加成功! [{gname}] {kw} -> {sn} ({actual_count}张){extra}")
             except Exception as e: await update.message.reply_text(f"失败: {e}")
             return
 
@@ -741,71 +954,126 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return  # Legacy, no longer supported
 
         elif mode == "add_inline":
-            parts = text.strip().split(maxsplit=1)
-            if len(parts) < 2: return await update.message.reply_text('格式: <关键词> <链接>')
-            kw, link = parts[0], parts[1]
-            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', link); sn = m.group(1) if m else link.strip().split('/')[-1].split('?')[0]
+            text2 = text.strip()
+            parts2 = text2.split(maxsplit=1)
+            if len(parts2) < 2: return await update.message.reply_text('格式: <关键词> [emoji] <链接>')
+            kw, rest = parts2[0], parts2[1]
+            emoji_filter = None
+            first_char = rest[0] if rest else ''
+            after = rest[1:].strip()
+            if first_char and ord(first_char) > 127 and after:
+                emoji_filter = _norm_emoji(first_char)
+                rest = after
+            m = re.search(r'add(?:stickers|emoji)/([a-zA-Z0-9_]+)', rest); sn = m.group(1) if m else rest.split('/')[-1].split('?')[0]
             if not sn: return await update.message.reply_text('无法提取包名')
             try:
-                ss = await context.bot.get_sticker_set(name=sn); sticks = _filter_blocked_stickers(sn, ss.stickers)
-                config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[kw] = {"set": sn, "mode": "limited"}
-                save_config(config)
-                inline_cache[sn] = sticks; _init_queue(sn, inline_cache, inline_queue)
-                inline_hand[sn] = {}
-                _save_hand()
-                gname = _get_group_name(gid)
-                await update.message.reply_text(f"内联添加成功! [{gname}] {kw} -> {sn} ({len(sticks)}张)")
+                ss = await context.bot.get_sticker_set(name=sn)
+                allowed = _filter_blocked_stickers(sn, ss.stickers)
+                # If emoji filter: use filtered cache key and only store matching stickers
+                if emoji_filter:
+                    from bot_config import _filtered_sn, _pack_emoji
+                    cache_sn = _filtered_sn(sn, emoji_filter)
+                    em = _pack_emoji.get(sn, {})
+                    filtered = [fid for fid in allowed if em.get(fid, '') == emoji_filter]
+                    logger.info(f"EMOJI_ADDINLINE_DEBUG: sn={sn} filter={repr(emoji_filter)} total={len(allowed)} matched={len(filtered)} emojis={list(set(em.values()))}")
+                    inline_cache[cache_sn] = filtered
+                    _init_queue(cache_sn, inline_cache, inline_queue)
+                    config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[kw] = {
+                        "set": sn, "mode": "limited", "exact": True, "sort": False,
+                        "emoji_filter": emoji_filter}
+                    save_config(config)
+                    inline_hand[cache_sn] = {}
+                    _save_hand()
+                    gname = _get_group_name(gid)
+                    await update.message.reply_text(
+                        f"内联添加成功! [{gname}] {kw} -> {sn} (只看{emoji_filter}) ({len(filtered)}/{len(allowed)}张)")
+                else:
+                    config.setdefault('inline_sticker_keywords',{}).setdefault(gid,{})[kw] = {
+                        "set": sn, "mode": "limited", "exact": True, "sort": False}
+                    save_config(config)
+                    inline_cache[sn] = allowed; _init_queue(sn, inline_cache, inline_queue)
+                    inline_hand[sn] = {}
+                    _save_hand()
+                    gname = _get_group_name(gid)
+                    await update.message.reply_text(f"内联添加成功! [{gname}] {kw} -> {sn} ({len(allowed)}张)")
             except Exception as e: await update.message.reply_text(f"失败: {e}")
             return
 
-    # -- Index send: 1-2-3/  or  1-2-3 (play cards from hand by position)
+    # -- Index send: 1-2-3/  or  1~3/ (play cards from hand by position, across ALL packs)
     idx_match = re.match(r'^(\d+(?:-\d+)+)(/?)$', text.strip())
     range_match = re.match(r'^(\d+)~(\d+)(/?)$', text.strip())
     if idx_match or range_match:
         uid = user_id
-        # Prefer last-used inline pack
+        # Build a flat combined hand list across ALL packs the user holds: [(sn, fid), ...]
+        sn_order = []
         last = _last_inline_kw.get(uid)
         target_sn = last['sn'] if last else None
-        sn_order = [target_sn] if target_sn else []
+        if target_sn:
+            sn_order.append(target_sn)
         sn_order += [sn for sn in inline_hand if sn != target_sn]
+        combined = []  # (sn, fid)
         for sn in sn_order:
             users = inline_hand.get(sn, {})
-            if uid in users and users[uid]:
-                hand = users[uid]
-                if range_match:
-                    start, end = int(range_match.group(1)), int(range_match.group(2))
-                    if start > end: start, end = end, start
-                    indices = list(range(start, end + 1))
-                    send_s = (range_match.group(3) == '/')
-                else:
-                    indices = [int(x) for x in idx_match.group(1).split('-')]
-                    send_s = (idx_match.group(2) == '/')
-                played = []
-                for idx in sorted(set(indices), reverse=True):
-                    i = idx - 1
-                    if 0 <= i < len(hand):
-                        played.insert(0, hand.pop(i))
-                # Save state BEFORE sending (crash-safe)
-                if _is_limited_set(sn):
-                    if sn in inline_shared_discard and uid in inline_shared_discard[sn]:
-                        dc = inline_shared_discard[sn].setdefault(uid, [])
-                    else:
-                        dc = inline_discard.setdefault(sn, {}).setdefault(uid, [])
-                    dc.extend(played)
-                    _save_json(DISCARD_FILE, inline_discard)
-                    _save_json(SHARED_DISCARD_FILE, inline_shared_discard)
-                if not hand:
-                    del users[uid]
-                _save_hand()
-                if send_s:
-                    for fid in played:
-                        kwargs = {"chat_id": update.effective_chat.id, "sticker": fid}
-                        tid = getattr(update.message, 'message_thread_id', None)
-                        if tid: kwargs["message_thread_id"] = tid
-                        try: await context.bot.send_sticker(**kwargs)
-                        except Exception as se: logger.warning(f"Play fail: {se}")
-                await update.message.reply_text(f"已打出 {len(played)} 张  |  手牌 {len(hand)} 张")
-                return
+            if uid in users:
+                for fid in users[uid]:
+                    combined.append((sn, fid))
+        if not combined:
+            await update.message.reply_text("手牌为空。")
+            return
+        # Parse requested indices
+        if range_match:
+            start, end = int(range_match.group(1)), int(range_match.group(2))
+            if start > end: start, end = end, start
+            indices = list(range(start, end + 1))
+            send_s = (range_match.group(3) == '/')
+        else:
+            indices = [int(x) for x in idx_match.group(1).split('-')]
+            send_s = (idx_match.group(2) == '/')
+        # Pop requested positions from the flat list (highest first to keep indices valid)
+        played = []  # [(sn, fid), ...]
+        for idx in sorted(set(indices), reverse=True):
+            i = idx - 1
+            if 0 <= i < len(combined):
+                played.insert(0, combined.pop(i))
+        if not played:
+            await update.message.reply_text("没有可打出的对应手牌。")
+            return
+        # Remove each played card from its own pack's hand and collect discards
+        discard_map = {}  # sn -> [fid, ...]
+        for sn, fid in played:
+            users = inline_hand.get(sn, {})
+            hand = users.get(uid)
+            if hand and fid in hand:
+                hand.remove(fid)
+            if _is_limited_set(sn):
+                discard_map.setdefault(sn, []).append(fid)
+            # 手动收藏包：同步从内联缓存移除，保持"内联包"与手牌一致
+            if sn == _MANUAL_SN and fid in inline_cache.get(sn, []):
+                inline_cache[sn].remove(fid)
+        # Persist discards (crash-safe, before sending)
+        for sn, fids in discard_map.items():
+            if sn in inline_shared_discard and uid in inline_shared_discard[sn]:
+                dc = inline_shared_discard[sn].setdefault(uid, [])
+            else:
+                dc = inline_discard.setdefault(sn, {}).setdefault(uid, [])
+            dc.extend(fids)
+        _save_json(DISCARD_FILE, inline_discard)
+        _save_json(SHARED_DISCARD_FILE, inline_shared_discard)
+        # Drop empty hands
+        for sn, fid in played:
+            users = inline_hand.get(sn, {})
+            if uid in users and not users[uid]:
+                del users[uid]
+        _save_hand()
+        # Send stickers if trailing slash present
+        if send_s:
+            for sn, fid in played:
+                kwargs = {"chat_id": update.effective_chat.id, "sticker": fid}
+                tid = getattr(update.message, 'message_thread_id', None)
+                if tid: kwargs["message_thread_id"] = tid
+                try: await context.bot.send_sticker(**kwargs)
+                except Exception as se: logger.warning(f"Play fail: {se}")
+        await update.message.reply_text(f"已打出 {len(played)} 张  |  手牌 {len(combined)} 张")
         return
 
     # -- Group-aware keyword detection --
@@ -1280,30 +1548,32 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         drawn = 0
-        chars = []    # 拼接的 emoji 字符
-        entities = [] # 对应的 MessageEntity 列表
+        chars = []; entities = []
         for i in range(count):
-            queue = emoji_queue.get(sn)
-            if not queue:
+            if emoji_mode == 'random':
+                # With replacement: pick randomly from all emojis
+                if not emoji_map: break
+                eid = random.choice(list(emoji_map.keys()))
+            else:
+                queue = emoji_queue.get(sn)
+                if not queue:
+                    if emoji_mode == 'limited':
+                        break
+                    try:
+                        ss = await context.bot.get_sticker_set(name=sn)
+                        emoji_cache[sn] = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
+                    except Exception: break
+                    _init_queue(sn, emoji_cache, emoji_queue); queue = emoji_queue.get(sn)
+                if not queue: break
+                eid = queue.pop()
                 if emoji_mode == 'limited':
-                    break
-                try:
-                    ss = await context.bot.get_sticker_set(name=sn)
-                    emoji_cache[sn] = {s.custom_emoji_id: s.emoji for s in ss.stickers if s.type == 'custom_emoji' and s.custom_emoji_id and s.emoji}
-                except Exception: break
-                _init_queue(sn, emoji_cache, emoji_queue); queue = emoji_queue.get(sn)
-            if not queue: break
-            eid = queue.pop()
-            emoji_char = emoji_map.get(eid, '\u2764')  # fallback to ❤ if not found
-            if emoji_mode == 'limited':
-                emoji_discard.setdefault(sn, {}).setdefault(user_id, []).append(eid)
-            # 记录 offset（UTF-16 编码下的偏移量）
+                    emoji_discard.setdefault(sn, {}).setdefault(user_id, []).append(eid)
+            emoji_char = emoji_map.get(eid, '\u2764')
             offset = sum(len(c.encode('utf-16-le')) // 2 for c in chars)
             char_len = len(emoji_char.encode('utf-16-le')) // 2
             chars.append(emoji_char)
             entities.append(MessageEntity(type='custom_emoji', offset=offset, length=char_len, custom_emoji_id=eid))
             drawn += 1
-        # 一次性发送所有 emoji
         if drawn:
             try:
                 kwargs = {"chat_id": update.effective_chat.id, "text": ''.join(chars), "entities": entities}
@@ -1312,7 +1582,6 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(**kwargs)
             except Exception as se:
                 logger.warning(f"Emoji batch send fail: {se}")
-        if drawn:
             _save_json(EMOJI_QUEUE_FILE, emoji_queue)
             if emoji_mode == 'limited':
                 _save_json(EMOJI_DISCARD_FILE, emoji_discard)
@@ -1328,21 +1597,28 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         inline_mode = _inline_get_mode(keyword, gid)
         shared = _inline_is_shared(keyword, gid)
         uid = user_id
+        # Get emoji filter for inline keywords
+        ik_cfg = config.get('inline_sticker_keywords', {}).get(gid, {}).get(keyword, {})
+        inline_emoji_filter = ik_cfg.get('emoji_filter') if isinstance(ik_cfg, dict) else None
+        # Use filtered cache key for emoji-filtered inline keywords
+        if inline_emoji_filter:
+            from bot_config import _filtered_sn
+            sn = _filtered_sn(sn, inline_emoji_filter)
 
         if shared and (sn not in inline_shared_queue or uid not in inline_shared_queue.get(sn, {})):
             _init_shared_pool(sn, uid)
 
-        def _iq_get(): return inline_shared_queue[sn][uid] if shared else _iq_get()
+        def _iq_get(): return inline_shared_queue[sn][uid] if shared else inline_queue.get(sn, [])
         def _iq_set(v): 
             if shared: inline_shared_queue[sn][uid] = v; _save_shared_state()
-            else: _iq_set(v);
-        def _id_get(): return inline_shared_discard.get(sn, {}) if shared else _id_get()
+            else: inline_queue[sn] = v; _save_json(INLINE_QUEUE_FILE, inline_queue)
+        def _id_get(): return inline_shared_discard.get(sn, {}) if shared else inline_discard.get(sn, {})
         def _id_clear(): 
             if shared: inline_shared_discard[sn] = {}; _save_shared_state()
-            else: _id_clear(); _id_save()
+            else: inline_discard[sn] = {}; _save_json(DISCARD_FILE, inline_discard)
         def _id_save():
             if shared: _save_shared_state()
-            else: _id_save()
+            else: _save_json(DISCARD_FILE, inline_discard)
 
         if peek:
             stickers = _iq_get()
@@ -1565,6 +1841,13 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parts = text.strip().split()
             if not parts or parts[0].lower() != keyword.lower(): continue
 
+        # Use filtered cache key if keyword has emoji_filter
+        kw_cfg = config.get('sticker_keywords', {}).get(gid, {}).get(keyword, {})
+        emoji_filter = kw_cfg.get('emoji_filter') if isinstance(kw_cfg, dict) else None
+        if emoji_filter:
+            from bot_config import _filtered_sn
+            sn = _filtered_sn(sn, emoji_filter)
+
         if recycle:
             await update.message.reply_text(f"贴纸关键词不支持 N- 回收。请使用内联或Emoji关键词。")
             return
@@ -1639,15 +1922,22 @@ async def handle_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i in range(count):
             use_random = mode_s == 'random'
             if use_random:
-                sid = random.choice(stickers)
+                # Filter by emoji if needed
+                if emoji_filter and sn in _pack_emoji:
+                    em = _pack_emoji[sn]
+                    pool = [fid for fid in stickers if em.get(fid, '') == emoji_filter]
+                else:
+                    pool = stickers
+                if not pool: break
+                sid = random.choice(pool)
             else:
                 queue = sticker_queue.get(sn)
                 if not queue:
                     if mode_s == 'limited': break
                     try:
-                        ss = await context.bot.get_sticker_set(name=sn); stickers = [s.file_id for s in ss.stickers]; sticker_cache[sn] = stickers
+                        ss = await context.bot.get_sticker_set(name=sn); stickers = _filter_blocked_stickers(sn, ss.stickers); sticker_cache[sn] = stickers
                     except Exception: break
-                    _init_queue(sn, sticker_cache, sticker_queue); queue = sticker_queue.get(sn)
+                    _init_queue(sn, sticker_cache, sticker_queue, emoji_filter); queue = sticker_queue.get(sn)
                 if not queue: break
                 sid = queue.pop(); _save_json(QUEUE_FILE, sticker_queue)
             if mode_s == 'limited':
@@ -1669,6 +1959,9 @@ _user_pack_usage: dict = {}  # {user_id: {sn: count}}
 _inline_merge_mode: dict = {}  # {user_id: bool}  default True
 _img_msg_map: dict = {}  # {message_id: (img_key, pool_file_id)} track sent photos
 
+# 回复贴纸 d 直接收藏的「手动手牌」包标识（不属于任何关键词，独立成包）
+_MANUAL_SN = "__manual_hand__"
+
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.inline_query.query.strip().lower()
     uid = update.inline_query.from_user.id
@@ -1680,6 +1973,8 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for gid, kws in config.get('inline_sticker_keywords', {}).items():
             for v in kws.values():
                 valid_packs.add(v.get('set', '') if isinstance(v, dict) else v)
+        # 手动收藏包也纳入手牌展示
+        valid_packs.add(_MANUAL_SN)
 
         if merge_on:
             # Mode 1: merge all packs
@@ -1690,7 +1985,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     merged.append((sn, fid))
             if merged:
                 results = [InlineQueryResultCachedSticker(
-                    id=f"h_{sn}_{i:03d}", sticker_file_id=fid
+                    id=f"h|{sn}|{i:03d}", sticker_file_id=fid
                 ) for i, (sn, fid) in enumerate(merged[:50])]
                 try:
                     await update.inline_query.answer(results, cache_time=1)
@@ -1712,7 +2007,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     best_sn = sn; break
         if best_sn and best_sn in inline_hand and uid in inline_hand[best_sn]:
             hand = inline_hand[best_sn][uid]
-            results = [InlineQueryResultCachedSticker(id=f"h_{best_sn}_{i:03d}", sticker_file_id=fid)
+            results = [InlineQueryResultCachedSticker(id=f"h|{best_sn}|{i:03d}", sticker_file_id=fid)
                        for i, fid in enumerate(hand[:50])]
             try:
                 await update.inline_query.answer(results, cache_time=1)
@@ -1725,6 +2020,11 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for keyword, v in kws.items():
             if keyword.lower() not in q: continue
             sn = v.get('set', '') if isinstance(v, dict) else v
+            # Use filtered cache key if keyword has emoji_filter
+            em_filter = v.get('emoji_filter') if isinstance(v, dict) else None
+            if em_filter:
+                from bot_config import _filtered_sn
+                sn = _filtered_sn(sn, em_filter)
             # Track last used
             _last_inline_kw[uid] = {'sn': sn, 'kw': keyword}
             hand = inline_hand.get(sn, {}).get(uid, [])
@@ -1734,7 +2034,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         switch_pm_text="你的手牌为空", switch_pm_parameter="empty")
                 except Exception: pass
                 return
-            results = [InlineQueryResultCachedSticker(id=f"h_{sn}_{i:03d}", sticker_file_id=fid)
+            results = [InlineQueryResultCachedSticker(id=f"h|{sn}|{i:03d}", sticker_file_id=fid)
                        for i, fid in enumerate(hand[:50])]
             try:
                 await update.inline_query.answer(results, cache_time=1)
@@ -1746,7 +2046,9 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chosen_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_id = update.chosen_inline_result.result_id
     uid = update.chosen_inline_result.from_user.id
-    parts = result_id.split('_', 2)
+    logger.info(f"chosen_inline: uid={uid} rid={result_id}")
+
+    parts = result_id.split('|', 2)
     if len(parts) < 3: return
     sn = parts[1]
     user_hand = inline_hand.get(sn, {}).get(uid, [])
@@ -1755,6 +2057,9 @@ async def chosen_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(parts[2])
         if idx < len(user_hand):
             played = user_hand.pop(idx)
+            # UNO: detect function cards by sticker position in unoame pack
+            from bot_uno import handle_uno_play
+            await handle_uno_play(uid, played, context)
             if _is_limited_set(sn):
                 if sn in inline_shared_discard and uid in inline_shared_discard[sn]:
                     inline_shared_discard[sn].setdefault(uid, []).append(played)
@@ -1762,8 +2067,13 @@ async def chosen_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     inline_discard.setdefault(sn, {}).setdefault(uid, []).append(played)
                     _save_json(DISCARD_FILE, inline_discard)
-                logger.info(f"Card discarded by {uid} to '{sn}': {len(inline_discard[sn][uid])} in discard")
-    except: pass
+                discard_len = len(inline_shared_discard[sn][uid]) if sn in inline_shared_discard and uid in inline_shared_discard[sn] else len(inline_discard.get(sn, {}).get(uid, []))
+                logger.info(f"Card discarded by {uid} to '{sn}': {discard_len} in discard")
+            # 手动收藏包：同步从内联缓存移除，保持"内联包"与手牌一致
+            if sn == _MANUAL_SN and played in inline_cache.get(sn, []):
+                inline_cache[sn].remove(played)
+    except Exception as e:
+        logger.warning(f"chosen_inline discard error for {sn}/{uid}: {e}")
     inline_hand.setdefault(sn, {})[uid] = user_hand
     _save_hand()
     # Track pack usage for default pack selection
@@ -1793,7 +2103,10 @@ async def handle_sticker_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
                 inline_hand.setdefault(sn, {}).setdefault(uid, []).append(sid)
                 mode_kw = _inline_get_mode(kw, gid_k)
                 if mode_kw == 'limited':
-                    inline_discard.setdefault(sn, {}).setdefault(uid, []).append(sid)
+                    if _inline_is_shared(kw, gid_k) and sn in inline_shared_discard:
+                        inline_shared_discard[sn].setdefault(uid, []).append(sid)
+                    else:
+                        inline_discard.setdefault(sn, {}).setdefault(uid, []).append(sid)
                 _save_inline_state()
                 kwargs_s = {"chat_id": update.effective_chat.id, "sticker": sid}
                 tid = getattr(update.message, 'message_thread_id', None)
@@ -1816,7 +2129,7 @@ async def handle_sticker_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
                 try: await context.bot.send_sticker(**kwargs_s)
                 except Exception as e: logger.warning(f"Trigger sticker fail: {e}")
             return
-        # Check emoji keywords
+        # Check emoji keywords → react with custom emoji
         ek = config.get('emoji_keywords', {}).get(gid_k, {})
         if kw in ek:
             sn = ek[kw].get('set', '') if isinstance(ek[kw], dict) else ek[kw]
@@ -1883,6 +2196,9 @@ async def handle_sticker_sent(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.info(f"Sticker discarded by {uid} to '{sn}': {len(inline_discard.get(sn,{}).get(uid,[]))} in discard")
             _save_hand()
             logger.info(f"Sticker played from {uid}'s hand '{sn}': {len(users.get(uid,[]))} remaining")
+            if sn == 'unoame':
+                from bot_uno import handle_uno_play
+                await handle_uno_play(uid, fid, context)
             return
 
 # ========== Photo handler for image keyword collection ==========
@@ -1902,16 +2218,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """d: 贴纸回收至手牌 / 图片回收至牌库；f: 图片弃置；k: 保留"""
     msg = update.message
-    if not msg or msg.text is None:
+    if not msg:
         return
-    action = msg.text.strip().lower()
-    if action not in ('d', 'f', 'k'):
+    text = (msg.text or msg.caption or '').strip().lower()
+    if not text:
         return
+    # 支持 dN 形式（如 d3 / d6）：回复贴纸向手牌添加 N 张相同的牌
+    # 支持 d 50% / d50% 形式：按百分比缩放贴纸（<=100% 透明补齐，>100% 居中裁剪）
+    add_n = 1
+    scale_pct = None
+    m_scale = re.fullmatch(r'd\s*(\d+)%', text)
+    if m_scale:
+        action = 'd'
+        add_n = 1
+        scale_pct = max(1, min(500, int(m_scale.group(1))))
+    else:
+        m_dn = re.fullmatch(r'd(\d+)', text)
+        if m_dn:
+            action = 'd'
+            add_n = int(m_dn.group(1))
+            if add_n < 1:
+                add_n = 1
+        elif text in ('d', 'f', 'k'):
+            action = text
+        else:
+            return
     uid = update.effective_user.id
     reply = msg.reply_to_message
     logger.info(f"Return card: action={action}, uid={uid}, has_reply={reply is not None}, reply_has_photo={getattr(reply, 'photo', None) is not None}, reply_is_bot={getattr(getattr(reply, 'from_user', None), 'is_bot', None)}")
     if not reply:
         return
+
+    # === 回复图片/视频/GIF + d：转成贴纸加入手牌（扩充功能）===
+    if action == 'd' and (reply.photo or reply.video or reply.animation):
+        mid = reply.message_id
+        # 图片牌库采集图（bot 发出、在 _img_msg_map 中）走下方原有回收逻辑，不在此处理
+        if not (reply.photo and mid in _img_msg_map):
+            await _reply_media_to_sticker(update, context, reply, uid, add_n, msg, scale_pct)
+            return
 
     # === Photo ===
     if reply.photo and reply.photo:
@@ -1975,6 +2319,24 @@ async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     fid = reply.sticker.file_id
 
+    # --- d N%: 已存在的贴纸按百分比缩放后加入手牌（透明补齐 / 居中裁剪）---
+    if action == 'd' and scale_pct:
+        if reply.sticker.is_animated:
+            await msg.reply_text("❌ 动态（tgs）贴纸暂不支持缩放")
+            return
+        try:
+            r = await _sticker_to_scaled_fid(context.bot, reply.sticker,
+                                             _extra_pack_admin_id(uid), scale_pct)
+        except Exception as e:
+            logger.warning(f"scale sticker failed: {e}")
+            r = None
+        if not r:
+            await msg.reply_text("❌ 缩放贴纸失败")
+            return
+        new_fid, kind = r
+        await _add_fid_to_manual_hand(uid, new_fid, kind, 1, msg, f" / 缩放{scale_pct}%")
+        return
+
     # --- d: unblock ⛔ sticker back to hand ---
     if action == 'd':
         for sn, users in inline_kept.items():
@@ -1986,9 +2348,10 @@ async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 # Add back to pool so it can be drawn again
                 if fid not in inline_cache.get(sn, []):
                     inline_cache.setdefault(sn, []).append(fid)
-                inline_hand.setdefault(sn, {}).setdefault(uid, []).append(fid)
+                hl = inline_hand.setdefault(sn, {}).setdefault(uid, [])
+                hl.extend([fid] * add_n)
                 _save_hand()
-                await msg.reply_text(f"♻️ ⛔已解除  |  手牌 {len(inline_hand[sn][uid])} 张")
+                await msg.reply_text(f"♻️ ⛔已解除  |  手牌 {len(hl)} 张")
                 return
 
     # --- k: keep card from hand/discard into permanent kept area ---
@@ -2032,10 +2395,11 @@ async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if uid in users and fid in users[uid]:
             users[uid].remove(fid)
             if not users[uid]: del users[uid]
-            inline_hand.setdefault(sn, {}).setdefault(uid, []).append(fid)
+            hl = inline_hand.setdefault(sn, {}).setdefault(uid, [])
+            hl.extend([fid] * add_n)
             _save_hand()
             _save_json(DISCARD_FILE, inline_discard)
-            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(inline_hand[sn][uid])} 张")
+            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(hl)} 张")
             return
 
     for sn, stickers in inline_cache.items():
@@ -2044,96 +2408,47 @@ async def handle_return_card(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if sn in inline_queue and fid in inline_queue[sn]:
                 inline_queue[sn].remove(fid)
                 _save_json(INLINE_QUEUE_FILE, inline_queue)
-            inline_hand.setdefault(sn, {}).setdefault(uid, []).append(fid)
+            hl = inline_hand.setdefault(sn, {}).setdefault(uid, [])
+            hl.extend([fid] * add_n)
             _save_hand()
-            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(inline_hand[sn][uid])} 张")
+            await msg.reply_text(f"♻️ 已回收  |  手牌 {len(hl)} 张")
             return
 
-    # --- NEW: sticker not in any existing pack → add to last-used inline keyword ---
-    last = _last_inline_kw.get(uid)
-    if not last:
-        await msg.reply_text("该贴纸不在任何内联牌库中。\n请先使用一次内联关键词（如「抽牌」），再回复 d。")
+    # --- 回复贴纸 d，直接加入「手牌」，无论是否在关键词里 ---
+    man = inline_hand.setdefault(_MANUAL_SN, {}).setdefault(uid, [])
+    if add_n == 1 and fid in man:
+        await msg.reply_text(f"ℹ️ 该贴纸已在手牌中  |  手牌 {len(man)} 张")
         return
-    kw, target_sn = last['kw'], last['sn']
-
-    # Find group_id for this keyword
-    target_gid = '_global'
-    for gid_k, kws in config.get('inline_sticker_keywords', {}).items():
-        if kw in kws:
-            target_gid = gid_k
-            break
-
-    # Get extra pack name
-    pack_name = await _ensure_extra_pack(context.bot, config.get('admin_ids', [uid])[0] if config.get('admin_ids') else uid)
-    if not pack_name:
-        await msg.reply_text("贴纸上传失败：无法创建额外贴纸包。")
-        return
-
-    # Download the sticker
-    try:
-        sticker_file = await context.bot.get_file(fid)
-        sticker_data = await sticker_file.download_as_bytearray()
-    except Exception as e:
-        await msg.reply_text(f"下载贴纸失败: {e}")
-        return
-
-    # Upload to extra pack
-    try:
-        await context.bot.add_sticker_to_set(
-            user_id=config.get('admin_ids', [uid])[0] if config.get('admin_ids') else uid,
-            name=pack_name,
-            sticker=InputSticker(sticker=bytes(sticker_data), emoji_list=["⭐"], format="static"),
-        )
-        # Refresh sticker pack cache
-        ss = await context.bot.get_sticker_set(name=pack_name)
-        new_file_ids = [s.file_id for s in ss.stickers]
-        # The newly added sticker is the last one
-        new_fid = new_file_ids[-1] if new_file_ids else None
-        if not new_fid:
-            await msg.reply_text("上传成功但无法获取贴纸ID。")
-            return
-    except Exception as e:
-        await msg.reply_text(f"上传贴纸失败: {e}")
-        return
-
-    # Add to keyword extras + inline cache
-    _add_keyword_extra(kw, new_fid, target_gid)
-    # Update inline cache
-    inline_cache.setdefault(target_sn, [])
-    if new_fid not in inline_cache[target_sn]:
-        inline_cache[target_sn].append(new_fid)
-    # Also add extra pack stickers to cache
-    if pack_name not in inline_cache:
-        inline_cache[pack_name] = new_file_ids
-    else:
-        inline_cache[pack_name] = list(set(inline_cache[pack_name] + new_file_ids))
-
-    # Add to user's hand
-    inline_hand.setdefault(target_sn, {}).setdefault(uid, []).append(new_fid)
+    man.extend([fid] * add_n)
+    # 同步到 inline_cache，便于系统识别为合法包（仅内存态，重启不持久）
+    ic = inline_cache.setdefault(_MANUAL_SN, [])
+    if fid not in ic:
+        ic.append(fid)
     _save_hand()
-
-    extra_count = len(_get_keyword_extras(kw, target_gid))
-    hand_count = len(inline_hand[target_sn][uid])
-    total_in_pool = len(inline_cache.get(target_sn, []))
-    await msg.reply_text(
-        f"✅ 已收录到「{kw}」牌库\n"
-        f"手牌 +1 ({hand_count}张)  |  牌库 +1 ({total_in_pool}张)  |  累计收录 {extra_count}张"
-    )
+    await msg.reply_text(f"✅ 已加入手牌  |  手牌 {len(man)} 张")
     return
 
 
-async def _ensure_extra_pack(bot, admin_id: int):
-    """确保 bot 自有额外贴纸包存在，返回包名。"""
+async def _add_to_extra_pack(bot, admin_id: int, sticker_bytes: bytes, fmt: str):
+    """把一张贴纸加入 bot 自有额外包；包不存在则用这张图作为首张建包。返回包名或 None。
+
+    关键：Telegram 静态贴纸必须恰好 512x512，不能用 1px 占位图建包，
+    否则 createNewStickerSet 会报尺寸错误。因此直接用真实贴纸建包。
+    """
     name = _get_extra_pack_name()
     if name:
         try:
             await bot.get_sticker_set(name=name)
+            await bot.add_sticker_to_set(
+                user_id=admin_id, name=name,
+                sticker=InputSticker(sticker=sticker_bytes, emoji_list=["⭐"], format=fmt))
             return name
-        except Exception:
-            pass  # Pack doesn't exist anymore, recreate
-    # Create new pack
+        except Exception as e:
+            logger.warning(f"add to extra pack failed, will recreate: {e}")
+            # 包可能已失效，落到下方重建
+    # 包不存在或失效：用这张真实贴纸建包（首张即它）
     for i in range(1, 50):
-        candidate = f"Extra_by_yu{i}_bot"
+        candidate = f"Extra{i}_by_{bot.username}"
         try:
             await bot.get_sticker_set(name=candidate)
         except Exception:
@@ -2141,26 +2456,11 @@ async def _ensure_extra_pack(bot, admin_id: int):
             break
     if not name:
         return None
-    # Need an initial sticker to create the pack — use a 1-pixel transparent PNG
-    import struct, zlib
-    def _make_1px_png():
-        sig = b'\x89PNG\r\n\x1a\n'
-        ihdr = struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0)
-        ihdr_crc = zlib.crc32(b'IHDR' + ihdr)
-        ihdr_chunk = struct.pack('>I', 13) + b'IHDR' + ihdr + struct.pack('>I', ihdr_crc)
-        raw = b'\x00' * 1
-        compressed = zlib.compress(raw)
-        idat_crc = zlib.crc32(b'IDAT' + compressed)
-        idat_chunk = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
-        iend_crc = zlib.crc32(b'IEND')
-        iend_chunk = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
-        return sig + ihdr_chunk + idat_chunk + iend_chunk
     try:
         await bot.create_new_sticker_set(
             user_id=admin_id, name=name,
             title=f"收录贴纸 {name.split('_by_')[0]}",
-            stickers=[InputSticker(sticker=_make_1px_png(), emoji_list=["⭐"], format="static")],
-            sticker_type="static",
+            stickers=[InputSticker(sticker=sticker_bytes, emoji_list=["⭐"], format=fmt)],
         )
         _set_extra_pack_name(name)
         logger.info(f"Created extra sticker pack: {name}")
@@ -2168,3 +2468,283 @@ async def _ensure_extra_pack(bot, admin_id: int):
     except Exception as e:
         logger.warning(f"Failed to create extra pack: {e}")
         return None
+
+
+# ========== Reply media -> sticker helpers ==========
+def _extra_pack_admin_id(uid):
+    """贴纸包归属 bot 管理员（共享收录包）。"""
+    aids = config.get('admin_ids') or []
+    return aids[0] if aids else uid
+
+
+def _ffmpeg_path():
+    p = shutil.which('ffmpeg')
+    if p:
+        return p
+    cand = r'C:\Users\Admin\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe'
+    if os.path.exists(cand):
+        return cand
+    return 'ffmpeg'
+
+
+def _scale_vf(pct: int | None) -> str:
+    """生成视频贴纸缩放滤镜链（先适配 512，再按百分比缩放）。
+
+    - pct 为 None/100：只做等比适配 + 透明补齐；
+    - pct <  100：等比适配后缩小，pad 用透明补齐回 512；
+    - pct >  100：等比适配后放大，先 pad 到 max(512, iw/ih) 再 crop 512 居中裁剪。
+      （pad 与 crop 串联是为了同时覆盖"某一边超出、另一边不足"的混合情况）
+    """
+    fit = 'format=rgba,scale=512:512:force_original_aspect_ratio=decrease'
+    tail = 'setsar=1'
+    if not pct or pct == 100:
+        return (f'{fit},'
+                'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,'
+                f'{tail}')
+    return (f'{fit},'
+            f'scale=trunc(iw*{pct}/100/2)*2:trunc(ih*{pct}/100/2)*2,'
+            r'pad=max(512\,iw):max(512\,ih):(ow-iw)/2:(oh-ih)/2:color=0x00000000,'
+            f'crop=512:512,{tail}')
+
+
+def _ffmpeg_input_decoder(src: str) -> list:
+    """WebM 源必须显式指定输入解码器，否则透明背景会变成不透明黑。
+
+    坑：ffmpeg 默认的（native）vp9 解码器**不合并 alpha 层**，解码带透明背景的
+    WebM 得到的是 (0,0,0,255) 纯黑，再怎么 pad 透明都救不回来。必须用
+    `-c:v libvpx-vp9` 作为输入解码器才能读出 alpha（得到 (0,0,0,0)）。
+    反过来，普通 mp4(h264) 指定 libvpx-vp9 解码会直接失败，所以只对 EBML 头生效。
+    """
+    try:
+        with open(src, 'rb') as fh:
+            if fh.read(4) == b'\x1a\x45\xdf\xa3':  # EBML magic -> WebM/VP9
+                return ['-c:v', 'libvpx-vp9']
+    except Exception:
+        pass
+    return []
+
+
+def _convert_video_to_webm(src: str, out: str, pct: int | None = None) -> bool:
+    """用 ffmpeg 把视频/GIF 转成 Telegram 视频贴纸要求的 WEBM（512x512, <=3s, 无声、透明背景）。
+    pct 不为 None 时按百分比缩放内容（<=100% 透明补齐，>100% 居中裁剪）。
+
+    Telegram 视频贴纸规范要求 yuva420p（VP9 + alpha 通道），非正方形素材的补齐区域
+    必须是透明的而不是黑边：先用 format=rgba 保证有 alpha，再 pad 用 0x00000000 透明填充，
+    最后 -pix_fmt yuva420p 让 VP9 把 alpha 层写进 BlockAdditional（容器里表现为 alpha_mode=1）。
+    """
+
+    def _args(dec):
+        return ([_ffmpeg_path(), '-y'] + dec + ['-i', src, '-t', '3', '-an',
+                '-vf', _scale_vf(pct),
+                '-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-b:v', '0', '-crf', '32',
+                out])
+
+    dec = _ffmpeg_input_decoder(src)
+    try:
+        subprocess.run(_args(dec), check=True, capture_output=True, timeout=120)
+        return os.path.getsize(out) > 0
+    except Exception as e:
+        if dec:  # 万一源是 VP8 等非 VP9 的 WebM，退回默认解码器再试一次
+            logger.warning(f"video->webm (forced decoder) failed, retry: {e}")
+            try:
+                subprocess.run(_args([]), check=True, capture_output=True, timeout=120)
+                return os.path.getsize(out) > 0
+            except Exception as e2:
+                logger.warning(f"video->webm failed: {e2}")
+                return False
+        logger.warning(f"video->webm failed: {e}")
+        return False
+
+
+def _extract_first_frame(src: str, out: str) -> bool:
+    """用 ffmpeg 抽取视频/GIF 首帧为 PNG（512x512，补齐区域透明）。"""
+    dec = _ffmpeg_input_decoder(src)
+    try:
+        subprocess.run(
+            [_ffmpeg_path(), '-y'] + dec + ['-i', src, '-vframes', '1',
+             '-vf', 'format=rgba,scale=512:512:force_original_aspect_ratio=decrease,'
+                    'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1',
+             out],
+            check=True, capture_output=True, timeout=60)
+        return os.path.getsize(out) > 0
+    except Exception as e:
+        if dec:
+            logger.warning(f"frame extract (forced decoder) failed, retry: {e}")
+            try:
+                subprocess.run(
+                    [_ffmpeg_path(), '-y', '-i', src, '-vframes', '1',
+                     '-vf', 'format=rgba,scale=512:512:force_original_aspect_ratio=decrease,'
+                            'pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1',
+                     out],
+                    check=True, capture_output=True, timeout=60)
+                return os.path.getsize(out) > 0
+            except Exception as e2:
+                logger.warning(f"frame extract failed: {e2}")
+                return False
+        logger.warning(f"frame extract failed: {e}")
+        return False
+
+
+async def _ensure_extra_pack_video(bot, admin_id: int):
+    """确保 bot 自有额外视频贴纸包存在，返回包名（不存在则返回 None，需先建）。"""
+    name = _get_extra_pack_video_name()
+    if name:
+        try:
+            await bot.get_sticker_set(name=name)
+            return name
+        except Exception:
+            pass
+    return None
+
+
+async def _create_video_pack(bot, admin_id: int, webm: bytes):
+    """用首个视频贴纸创建视频贴纸包，返回包名。"""
+    for i in range(1, 50):
+        candidate = f"ExtraV{i}_by_{bot.username}"
+        try:
+            await bot.get_sticker_set(name=candidate)
+        except Exception:
+            name = candidate
+            break
+    else:
+        return None
+    try:
+        await bot.create_new_sticker_set(
+            user_id=admin_id, name=name, title=f"收录视频 {name.split('_by_')[0]}",
+            stickers=[InputSticker(sticker=webm, emoji_list=["⭐"], format="video")],
+        )
+        _set_extra_pack_video_name(name)
+        logger.info(f"Created extra video sticker pack: {name}")
+        return name
+    except Exception as e:
+        logger.warning(f"Failed to create video pack: {e}")
+        return None
+
+
+async def _push_static_sticker(bot, admin_id: int, png: bytes):
+    """512 PNG 静态贴纸入库（额外包），返回 (file_id, 'static') 或 None。"""
+    name = await _add_to_extra_pack(bot, admin_id, png, "static")
+    if not name:
+        return None
+    ss = await bot.get_sticker_set(name=name)
+    return ss.stickers[-1].file_id, 'static'
+
+
+async def _push_video_sticker(bot, admin_id: int, webm: bytes):
+    """WEBM 视频贴纸入库（额外视频包），返回 (file_id, 'video') 或 None。"""
+    existing = await _ensure_extra_pack_video(bot, admin_id)
+    if existing:
+        try:
+            await bot.add_sticker_to_set(user_id=admin_id, name=existing,
+                sticker=InputSticker(sticker=webm, emoji_list=["⭐"], format="video"))
+            ss = await bot.get_sticker_set(name=existing)
+            return ss.stickers[-1].file_id, 'video'
+        except Exception as e:
+            logger.warning(f"add video sticker failed, try new pack: {e}")
+    name = await _create_video_pack(bot, admin_id, webm)
+    if name:
+        ss = await bot.get_sticker_set(name=name)
+        return ss.stickers[-1].file_id, 'video'
+    return None
+
+
+async def _photo_to_sticker_fid(bot, reply, admin_id: int, scale_pct: int | None = None):
+    """图片 -> 512 PNG 静态贴纸 -> 额外包，返回 (file_id, 'static')。
+
+    scale_pct 不为 None 时按百分比缩放（先适配 512，再按百分比缩放 + 透明补齐/居中裁剪）。
+    """
+    from bot_makepack import _resize_sticker, _scale_sticker_pct
+    photo = reply.photo[-1]
+    f = await bot.get_file(photo.file_id)
+    data = await f.download_as_bytearray()
+    png = _resize_sticker(bytes(data), 512)
+    if scale_pct:
+        png = _scale_sticker_pct(png, scale_pct, 512)
+    return await _push_static_sticker(bot, admin_id, png)
+
+
+async def _video_to_sticker_fid(bot, reply, admin_id: int, scale_pct: int | None = None):
+    """视频/GIF -> 优先动态贴纸(WEBM)，失败回退静态首帧。返回 (file_id, 'video'|'static') 或 None。"""
+    from bot_makepack import _resize_sticker, _scale_sticker_pct
+    src_file_id = reply.video.file_id if reply.video else reply.animation.file_id
+    f = await bot.get_file(src_file_id)
+    data = await f.download_as_bytearray()
+    tmp = tempfile.mkdtemp()
+    src = os.path.join(tmp, 'in.mp4')
+    out_webm = os.path.join(tmp, 'out.webm')
+    out_png = os.path.join(tmp, 'frame.png')
+    try:
+        with open(src, 'wb') as fh:
+            fh.write(data)
+        # --- 优先：动态视频贴纸 ---
+        if _convert_video_to_webm(src, out_webm, scale_pct):
+            webm = open(out_webm, 'rb').read()
+            r = await _push_video_sticker(bot, admin_id, webm)
+            if r:
+                return r
+        # --- 回退：首帧 -> 静态贴纸 ---
+        if _extract_first_frame(src, out_png):
+            png = _resize_sticker(open(out_png, 'rb').read(), 512)
+            if scale_pct:
+                png = _scale_sticker_pct(png, scale_pct, 512)
+            return await _push_static_sticker(bot, admin_id, png)
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def _sticker_to_scaled_fid(bot, sticker, admin_id: int, pct: int):
+    """已有贴纸按百分比缩放后重新入库，返回 (file_id, 'video'|'static') 或 None。"""
+    from bot_makepack import _resize_sticker, _scale_sticker_pct
+    f = await bot.get_file(sticker.file_id)
+    data = await f.download_as_bytearray()
+    if getattr(sticker, 'is_video', False):
+        tmp = tempfile.mkdtemp()
+        src = os.path.join(tmp, 'in.webm')
+        out_webm = os.path.join(tmp, 'out.webm')
+        try:
+            with open(src, 'wb') as fh:
+                fh.write(data)
+            if not _convert_video_to_webm(src, out_webm, pct):
+                return None
+            return await _push_video_sticker(bot, admin_id, open(out_webm, 'rb').read())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    png = _resize_sticker(bytes(data), 512)
+    png = _scale_sticker_pct(png, pct, 512)
+    return await _push_static_sticker(bot, admin_id, png)
+
+
+async def _add_fid_to_manual_hand(uid, fid, kind, add_n, msg, extra=""):
+    """把贴纸 file_id 加入手动手牌并回复。"""
+    man = inline_hand.setdefault(_MANUAL_SN, {}).setdefault(uid, [])
+    if add_n == 1 and fid in man:
+        await msg.reply_text(f"ℹ️ 该贴纸已在手牌中  |  手牌 {len(man)} 张")
+        return
+    man.extend([fid] * add_n)
+    ic = inline_cache.setdefault(_MANUAL_SN, [])
+    if fid not in ic:
+        ic.append(fid)
+    _save_hand()
+    label = "视频贴纸" if kind == 'video' else "贴纸"
+    await msg.reply_text(f"✅ 已加入手牌（{label}{extra}）  |  手牌 {len(man)} 张")
+
+
+async def _reply_media_to_sticker(update, context, reply, uid, add_n, msg, scale_pct=None):
+    """回复图片/视频/GIF + d（可带 N% 缩放）：转成贴纸后加入手动手牌。"""
+    bot = context.bot
+    try:
+        admin = _extra_pack_admin_id(uid)
+        if reply.video or reply.animation:
+            result = await _video_to_sticker_fid(bot, reply, admin, scale_pct)
+        else:
+            result = await _photo_to_sticker_fid(bot, reply, admin, scale_pct)
+        if not result:
+            await msg.reply_text("❌ 转换贴纸失败（图片/视频无法处理）")
+            return
+        fid, kind = result
+        extra = f" / 缩放{scale_pct}%" if scale_pct else ""
+        await _add_fid_to_manual_hand(uid, fid, kind, add_n, msg, extra)
+    except Exception as e:
+        logger.warning(f"reply media to sticker error: {e}")
+        await msg.reply_text(f"❌ 转换失败: {e}")

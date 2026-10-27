@@ -501,6 +501,31 @@ async def minidata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def handle_start_param(update: Update, context: ContextTypes.DEFAULT_TYPE, arg0: str):
+    """处理 /start score:层_杀 深链回传（菜单/内联入口、bot 无公网地址时的兜底）。
+
+    深链参数受 64 字符 + 仅 [A-Za-z0-9_-] 限制，无法携带 initData/中文名；
+    但 /start 消息本身由真实用户发出，update.effective_user 即为身份，足够记账。
+    """
+    try:
+        kind, _, body = arg0.partition(":")
+        if kind == "score":
+            level_s, _, kills_s = body.partition("_")
+            level = int(level_s or 0)
+            kills = int(kills_s or 0)
+            user = update.effective_user
+            uid = user.id
+            name = user.first_name or (("@" + user.username) if user.username else f"玩家{str(uid)[-4:]}")
+            rec = record_score(uid, name, level, kills)
+            _schedule_sync()
+            await update.message.reply_text(
+                f"✅ 成绩已记录：第 {level} 层 / 击杀 {kills}（累计 {rec['runs']} 局）\n用 /rank 查看排行榜"
+            )
+        # name: 深链不支持中文，忽略（改名请走键盘 sendData 或公网端点）
+    except Exception as e:
+        logger.warning(f"[深链] 解析失败: {e}")
+
+
 async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """展示排行榜 Top 20。"""
     data = _load_rank()
