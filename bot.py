@@ -173,7 +173,8 @@ if __name__ == '__main__':
         report_app = make_report_app()
         if webhook_url:
             logger.info(f"Webhook mode: {webhook_url}")
-            # 把 Mini App 上报端点挂到同一个 aiohttp 应用上（web=），与 webhook 共用端口
+            # 公网 webhook 部署：把 Mini App 上报端点挂到同一个 aiohttp 应用上（web=），
+            # 与 Telegram 的 webhook 共用端口，/api/score 才能被公网 Mini App 访问到。
             from urllib.parse import urlparse
             webhook_path = urlparse(webhook_url).path or '/webhook'
             app.run_webhook(
@@ -185,19 +186,8 @@ if __name__ == '__main__':
                 allowed_updates=Update.ALL_TYPES,
             )
         else:
-            # Polling 模式：PTB 不占用端口，单独起一个 aiohttp 服务监听 $PORT，
-            # 既提供 /api/score 上报端点，也满足 Railway 的健康检查（GET / 返回 200）。
-            if report_app is not None:
-                import threading
-                def _run_report():
-                    try:
-                        from aiohttp import web as _w
-                        _w.run_app(report_app, host="0.0.0.0", port=port)
-                    except Exception as e:
-                        logger.critical(f"上报服务启动失败: {e}")
-                t = threading.Thread(target=_run_report, daemon=True)
-                t.start()
-                logger.info(f"Polling mode: 上报服务已起在端口 {port}")
+            # Polling 模式（本机运行等）：PTB 不占用端口，上报端点也无公网可达性，
+            # 菜单/内联入口记成绩走 t.me 深链兜底即可，这里不额外起服务。
             app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except Exception as e:
         import traceback
